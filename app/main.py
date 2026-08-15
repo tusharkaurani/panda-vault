@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 load_dotenv()
 
 from . import cache, telegram_client  # noqa: E402  (needs env vars loaded first)
-from .routers import channels, collections, documents, downloads, search  # noqa: E402
+from .routers import auth, channels, collections, documents, downloads, search  # noqa: E402
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 
@@ -35,11 +35,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Panda Vault", lifespan=lifespan)
 
+app.include_router(auth.router)
 app.include_router(channels.router)
 app.include_router(collections.router)
 app.include_router(documents.router)
 app.include_router(downloads.router)
 app.include_router(search.router)
+
+
+@app.middleware("http")
+async def require_telegram_auth(request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path != "/api/health" and not path.startswith("/api/auth/"):
+        if not await telegram_client.is_authorized():
+            return JSONResponse({"detail": "Telegram login required"}, status_code=401)
+    return await call_next(request)
 
 
 @app.get("/api/health")

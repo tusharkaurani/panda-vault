@@ -10,8 +10,10 @@ __pycache__/
 # Node / frontend build
 frontend/node_modules/
 frontend/dist/
+frontend/tsconfig.tsbuildinfo
 node_modules/
 dist/
+/static
 
 # Editor/OS cruft
 .DS_Store

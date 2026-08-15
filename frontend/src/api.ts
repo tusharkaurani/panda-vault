@@ -30,6 +30,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export { ApiError };
 
 export const api = {
+  auth: {
+    status: () => request<{ authorized: boolean }>("/auth/status"),
+    sendCode: (phone: string) => request<{ sent: boolean }>("/auth/send-code", { method: "POST", body: JSON.stringify({ phone }) }),
+    signIn: (code: string) => request<{ authorized: boolean; needsPassword?: boolean }>("/auth/sign-in", { method: "POST", body: JSON.stringify({ code }) }),
+    signInPassword: (password: string) => request<{ authorized: boolean }>("/auth/sign-in-password", { method: "POST", body: JSON.stringify({ password }) }),
+    qrLoginStart: () => request<{ url: string; expires: number }>("/auth/qr-login/start", { method: "POST" }),
+    qrLoginPoll: () =>
+      request<{ status: "pending" | "authorized" | "needs_password" | "expired" | "error"; error?: string }>("/auth/qr-login/poll"),
+  },
   channels: {
     list: () => request<Channel[]>("/channels"),
     create: (body: { name: string; description: string; channel: string; allowedExtensions: string[] }) =>

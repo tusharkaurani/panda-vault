@@ -2,7 +2,7 @@ services:
   panda-vault:
     image: panda-vault
     build:
-      context: .           # no upstream image is published — always build locally
+      context: .           # builds from source instead of pulling dockerpanda1206/panda-vault
     container_name: panda-vault
     mem_limit: 256m
     cpus: "0.5"

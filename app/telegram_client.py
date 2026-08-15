@@ -12,7 +12,8 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telethon.tl.custom import QRLogin
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import DocumentAttributeFilename
@@ -23,6 +24,7 @@ from .models import DocumentOut
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
 SESSION_PATH = os.path.join(CONFIG_DIR, "session")
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -33,6 +35,10 @@ log = logging.getLogger("panda_vault.telegram_client")
 
 _refresh_task: Optional[asyncio.Task] = None
 _channel_locks: Dict[str, asyncio.Lock] = {}
+_login_phone: Optional[str] = None
+_qr: Optional[QRLogin] = None
+_qr_task: Optional[asyncio.Task] = None
+_qr_result: Dict = {"status": "pending"}
 
 
 def _lock_for(channel_id: str) -> asyncio.Lock:
@@ -46,11 +52,76 @@ _INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)([\w-]+)", re.IGNO
 
 
 async def start() -> None:
-    await client.start()
+    """Connect only — never blocks on interactive login. First-run auth is
+    driven through the /api/auth endpoints (web login flow) instead of a
+    terminal prompt, since the app is meant to run unattended in a
+    container."""
+    await client.connect()
 
 
 async def stop() -> None:
     await client.disconnect()
+
+
+async def is_authorized() -> bool:
+    return client.is_connected() and await client.is_user_authorized()
+
+
+async def send_code(phone: str) -> None:
+    global _login_phone
+    _login_phone = phone
+    await client.send_code_request(phone)
+
+
+async def sign_in_code(code: str) -> bool:
+    """Returns True if fully signed in, False if the account needs a 2FA
+    password next (call sign_in_password)."""
+    if not _login_phone:
+        raise RuntimeError("Send a login code first")
+    try:
+        await client.sign_in(_login_phone, code)
+        return True
+    except SessionPasswordNeededError:
+        return False
+
+
+async def sign_in_password(password: str) -> None:
+    await client.sign_in(password=password)
+
+
+async def qr_login_start() -> Tuple[str, float]:
+    """Starts (or restarts) a QR login flow. A background task owns the
+    single `wait()` call for the code's whole lifetime so the event
+    handler that catches Telegram's scan notification stays registered
+    continuously — polling `wait()` itself per HTTP request would leave
+    gaps where a scan could be missed. Returns (url, expires_epoch)."""
+    global _qr, _qr_task, _qr_result
+    if _qr_task and not _qr_task.done():
+        _qr_task.cancel()
+    _qr = await client.qr_login()
+    _qr_result = {"status": "pending"}
+    _qr_task = asyncio.create_task(_qr_wait())
+    return _qr.url, _qr.expires.timestamp()
+
+
+async def _qr_wait() -> None:
+    global _qr_result
+    qr = _qr
+    try:
+        await qr.wait()
+        _qr_result = {"status": "authorized"}
+    except SessionPasswordNeededError:
+        _qr_result = {"status": "needs_password"}
+    except asyncio.TimeoutError:
+        _qr_result = {"status": "expired"}
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        _qr_result = {"status": "error", "error": str(e)}
+
+
+def qr_login_poll() -> Dict:
+    return dict(_qr_result)
 
 
 def _get_filename(document) -> str:
@@ -198,6 +269,8 @@ async def download_stream(channel_ref: str, msg_id: int):
 
 
 async def _refresh_all_once() -> None:
+    if not await is_authorized():
+        return
     for channel in store.load_channels():
         try:
             await list_documents(channel.id, channel.channel, force_refresh=True)

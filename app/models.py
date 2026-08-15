@@ -88,5 +88,17 @@ class DocumentOut(BaseModel):
     channelId: Optional[str] = None
 
 
+class PhoneIn(BaseModel):
+    phone: str
+
+
+class CodeIn(BaseModel):
+    code: str
+
+
+class PasswordIn(BaseModel):
+    password: str
+
+
 Collection.model_rebuild()
 CollectionTreeNode.model_rebuild()
