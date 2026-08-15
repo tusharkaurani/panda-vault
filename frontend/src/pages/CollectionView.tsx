@@ -211,7 +211,7 @@ export default function CollectionView() {
           {node.children.length === 0 ? (
             <EmptyState title="This collection is empty" hint="Add sub-collections or bind a channel to it from Settings." />
           ) : (
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+            <div className="grid grid-cols-1 min-[420px]:grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
               {node.children.map((c) => (
                 <CollectionCard key={c.id} collection={c} />
               ))}

@@ -49,7 +49,7 @@ export default function Landing() {
       )}
 
       {collections && collections.length > 0 && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
+        <div className="grid grid-cols-1 min-[420px]:grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
           {collections.map((c) => (
             <CollectionCard key={c.id} collection={c} />
           ))}

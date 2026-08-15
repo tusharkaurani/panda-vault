@@ -125,7 +125,7 @@ function CollectionNode({
   return (
     <div>
       <div
-        className="flex items-center gap-2 rounded-lg border border-panda-border bg-panda-surface px-3 py-2"
+        className="flex items-center flex-wrap gap-2 rounded-lg border border-panda-border bg-panda-surface px-3 py-2"
         style={{ marginLeft: depth * 20 }}
       >
         <button
@@ -156,7 +156,7 @@ function CollectionNode({
         <select
           value=""
           onChange={(e) => e.target.value && handleMove(e.target.value)}
-          className="hidden sm:block bg-panda-surface2 border border-panda-border rounded-md text-xs px-2 py-1 outline-none"
+          className="shrink-0 bg-panda-surface2 border border-panda-border rounded-md text-xs px-2 py-1 outline-none"
           title="Move to…"
           disabled={busy}
         >
