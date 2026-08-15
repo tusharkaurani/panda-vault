@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ChevronRight, Home, Loader2, RefreshCw } from "lucide-react";
+import { ChevronRight, ExternalLink, Home, Loader2, RefreshCw } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { DocumentOut, Channel, Collection } from "../types";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
+import { telegramUrl } from "../lib/telegram";
 import CollectionCard from "../components/CollectionCard";
+import CopyLinkButton from "../components/CopyLinkButton";
 import DocumentRow from "../components/DocumentRow";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
@@ -12,13 +14,6 @@ import KeywordPills from "../components/KeywordPills";
 import StatusBadge from "../components/StatusBadge";
 
 const PAGE_SIZE = 20;
-
-function telegramUrl(channel: string): string {
-  const trimmed = channel.trim();
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-  const handle = trimmed.replace(/^@/, "").replace(/^t\.me\//i, "");
-  return `https://t.me/${handle}`;
-}
 
 function findPath(nodes: Collection[], id: string, trail: Collection[] = []): Collection[] | null {
   for (const n of nodes) {
@@ -171,14 +166,16 @@ export default function CollectionView() {
         {channels.length === 1 && (
           <div className="flex items-center gap-2">
             <StatusBadge joined={channels[0].joined} />
+            <span className="text-xs text-panda-muted">{channels[0].name}</span>
+            <CopyLinkButton url={telegramUrl(channels[0].channel)} />
             <a
               href={telegramUrl(channels[0].channel)}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-xs text-panda-muted hover:text-panda-accent hover:underline"
+              className="text-panda-muted hover:text-panda-accent"
               title={`Open ${channels[0].channel} on Telegram`}
             >
-              {channels[0].name}
+              <ExternalLink size={14} />
             </a>
           </div>
         )}
@@ -187,14 +184,16 @@ export default function CollectionView() {
             {channels.map((c) => (
               <span key={c.id} className="flex items-center gap-1 text-xs text-panda-muted bg-panda-surface2 rounded-full px-2 py-1">
                 <StatusBadge joined={c.joined} />
+                <span>{c.name}</span>
+                <CopyLinkButton url={telegramUrl(c.channel)} size={12} />
                 <a
                   href={telegramUrl(c.channel)}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="hover:text-panda-accent hover:underline"
+                  className="hover:text-panda-accent"
                   title={`Open ${c.channel} on Telegram`}
                 >
-                  {c.name}
+                  <ExternalLink size={12} />
                 </a>
               </span>
             ))}

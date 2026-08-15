@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { ChevronRight, Home, Plus, RefreshCw, Pencil, Trash2, LogIn, RotateCw } from "lucide-react";
+import { ChevronRight, ExternalLink, Home, Plus, RefreshCw, Pencil, Trash2, LogIn, RotateCw } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Channel, Collection } from "../types";
+import { telegramUrl } from "../lib/telegram";
 import ChannelForm, { ChannelFormValues } from "../components/ChannelForm";
 import CollectionTreeEditor, { CollectionCreateForm } from "../components/CollectionTreeEditor";
+import CopyLinkButton from "../components/CopyLinkButton";
 import StatusBadge from "../components/StatusBadge";
 import ErrorBanner from "../components/ErrorBanner";
 import EmptyState from "../components/EmptyState";
@@ -198,6 +200,20 @@ export default function Settings() {
                     >
                       {busyChannelId === c.id ? <RefreshCw size={16} className="animate-spin" /> : <RotateCw size={16} />}
                     </button>
+                    <CopyLinkButton
+                      url={telegramUrl(c.channel)}
+                      size={16}
+                      className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                    />
+                    <a
+                      href={telegramUrl(c.channel)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                      title={`Open ${c.channel} on Telegram`}
+                    >
+                      <ExternalLink size={16} />
+                    </a>
                     <button
                       onClick={() => setEditingChannel(c)}
                       className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
