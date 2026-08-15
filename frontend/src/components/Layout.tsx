@@ -2,6 +2,7 @@ import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Search as SearchIcon, Settings as SettingsIcon } from "lucide-react";
 import ThemeToggle from "./ThemeToggle";
+import NotificationBell from "./NotificationBell";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
 
 export default function Layout({ children }: { children: ReactNode }) {
@@ -58,6 +59,8 @@ export default function Layout({ children }: { children: ReactNode }) {
           </form>
 
           <ThemeToggle />
+
+          <NotificationBell />
 
           <Link
             to="/settings"

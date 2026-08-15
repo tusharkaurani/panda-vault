@@ -8,10 +8,12 @@ import CollectionTreeEditor, { CollectionCreateForm } from "../components/Collec
 import StatusBadge from "../components/StatusBadge";
 import ErrorBanner from "../components/ErrorBanner";
 import EmptyState from "../components/EmptyState";
+import { useNotifications } from "../notifications/NotificationContext";
 
 type Tab = "channels" | "collections";
 
 export default function Settings() {
+  const { pushToast } = useNotifications();
   const [tab, setTab] = useState<Tab>("channels");
   const [channels, setChannels] = useState<Channel[] | null>(null);
   const [collections, setCollections] = useState<Collection[] | null>(null);
@@ -42,7 +44,7 @@ export default function Settings() {
       setAddingChannel(false);
       refresh();
     } catch (e) {
-      alert(e instanceof ApiError ? e.message : "Failed to add channel");
+      pushToast(e instanceof ApiError ? e.message : "Failed to add channel", "error");
     }
   }
 
@@ -52,7 +54,7 @@ export default function Settings() {
       setEditingChannel(null);
       refresh();
     } catch (e) {
-      alert(e instanceof ApiError ? e.message : "Failed to update channel");
+      pushToast(e instanceof ApiError ? e.message : "Failed to update channel", "error");
     }
   }
 
@@ -66,13 +68,13 @@ export default function Settings() {
           try {
             await api.channels.remove(c.id, true);
           } catch (e2) {
-            alert(e2 instanceof ApiError ? e2.message : "Failed to delete channel");
+            pushToast(e2 instanceof ApiError ? e2.message : "Failed to delete channel", "error");
           }
         } else {
           return;
         }
       } else {
-        alert(e instanceof ApiError ? e.message : "Failed to delete channel");
+        pushToast(e instanceof ApiError ? e.message : "Failed to delete channel", "error");
         return;
       }
     }
@@ -84,7 +86,7 @@ export default function Settings() {
     try {
       await api.channels.join(c.id);
     } catch (e) {
-      alert(e instanceof ApiError ? e.message : "Could not join/verify channel");
+      pushToast(e instanceof ApiError ? e.message : "Could not join/verify channel", "error");
     } finally {
       setBusyChannelId(null);
       refresh();
@@ -98,8 +100,9 @@ export default function Settings() {
     setBusyChannelId(c.id);
     try {
       await api.channels.rebuild(c.id);
+      pushToast(`Rebuild started for "${c.name}" — you'll get notified when it's done.`, "info");
     } catch (e) {
-      alert(e instanceof ApiError ? e.message : "Failed to start rebuild");
+      pushToast(e instanceof ApiError ? e.message : "Failed to start rebuild", "error");
     } finally {
       setBusyChannelId(null);
       refresh();

@@ -1,6 +1,8 @@
 import asyncio
 import logging
-from typing import List
+import time
+import uuid
+from typing import Dict, List
 
 from fastapi import APIRouter, HTTPException
 
@@ -10,6 +12,30 @@ from ..telegram_client import join_channel, list_documents, resolve_and_check
 
 router = APIRouter(prefix="/api/channels", tags=["channels"])
 log = logging.getLogger("panda_vault.channels")
+
+# In-memory rebuild job tracker so the frontend can notify on completion
+# instead of only on the fire-and-forget 202 that starts the scan. Not
+# persisted — jobs are only meaningful for the life of this process, which
+# matches how the rest of the cache works.
+_rebuild_jobs: Dict[str, dict] = {}
+_MAX_JOBS = 50
+
+
+def _record_job(channel: Channel) -> str:
+    job_id = uuid.uuid4().hex
+    _rebuild_jobs[job_id] = {
+        "id": job_id,
+        "channelId": channel.id,
+        "channelName": channel.name,
+        "status": "running",
+        "startedAt": time.time(),
+        "finishedAt": None,
+        "error": None,
+    }
+    if len(_rebuild_jobs) > _MAX_JOBS:
+        oldest = sorted(_rebuild_jobs.values(), key=lambda j: j["startedAt"])[0]
+        del _rebuild_jobs[oldest["id"]]
+    return job_id
 
 
 async def _warm_cache(channel: Channel) -> None:
@@ -29,19 +55,27 @@ async def _warm_cache(channel: Channel) -> None:
         cache.invalidate(channel.id)
 
 
-async def _rebuild_cache(channel: Channel) -> None:
+async def _rebuild_cache(job_id: str, channel: Channel) -> None:
     """Manual "Rebuild" trigger: discards whatever's cached for this
     channel and re-scans its entire message history from scratch. Unlike
     the incremental min_id-based refresh used everywhere else, this is
     for recovering from a corrupted/stale cache or picking up messages
     that were deleted-and-reposted with lower IDs than the last scan."""
+    job = _rebuild_jobs.get(job_id)
     try:
         await list_documents(channel.id, channel.channel, full_rebuild=True)
     except Exception as e:
         log.warning("Cache rebuild failed for channel %s: %s", channel.id, e)
+        if job:
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["finishedAt"] = time.time()
         return
     if not any(c.id == channel.id for c in store.load_channels()):
         cache.invalidate(channel.id)
+    if job:
+        job["status"] = "done"
+        job["finishedAt"] = time.time()
 
 
 def _collections_using_channel(collections, channel_id: str):
@@ -146,7 +180,7 @@ async def join(channel_id: str):
 
 
 @router.post("/{channel_id}/rebuild", status_code=202)
-def rebuild_channel(channel_id: str):
+async def rebuild_channel(channel_id: str):
     channels = store.load_channels()
     for c in channels:
         if c.id == channel_id:
@@ -154,9 +188,15 @@ def rebuild_channel(channel_id: str):
             # stop showing stale data right away instead of waiting for
             # the background scan to finish.
             cache.invalidate(channel_id)
-            asyncio.create_task(_rebuild_cache(c))
-            return {"rebuilding": True}
+            job_id = _record_job(c)
+            asyncio.create_task(_rebuild_cache(job_id, c))
+            return {"rebuilding": True, "jobId": job_id}
     raise HTTPException(404, "Channel not found")
+
+
+@router.get("/rebuild-jobs")
+def rebuild_jobs():
+    return {"jobs": sorted(_rebuild_jobs.values(), key=lambda j: j["startedAt"], reverse=True)}
 
 
 @router.get("/{channel_id}/status")

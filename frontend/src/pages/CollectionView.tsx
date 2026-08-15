@@ -13,6 +13,13 @@ import StatusBadge from "../components/StatusBadge";
 
 const PAGE_SIZE = 20;
 
+function telegramUrl(channel: string): string {
+  const trimmed = channel.trim();
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  const handle = trimmed.replace(/^@/, "").replace(/^t\.me\//i, "");
+  return `https://t.me/${handle}`;
+}
+
 function findPath(nodes: Collection[], id: string, trail: Collection[] = []): Collection[] | null {
   for (const n of nodes) {
     const next = [...trail, n];
@@ -164,14 +171,31 @@ export default function CollectionView() {
         {channels.length === 1 && (
           <div className="flex items-center gap-2">
             <StatusBadge joined={channels[0].joined} />
-            <span className="text-xs text-panda-muted">{channels[0].channel}</span>
+            <a
+              href={telegramUrl(channels[0].channel)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-panda-muted hover:text-panda-accent hover:underline"
+              title={`Open ${channels[0].channel} on Telegram`}
+            >
+              {channels[0].name}
+            </a>
           </div>
         )}
         {channels.length > 1 && (
           <div className="flex items-center gap-1.5 flex-wrap justify-end">
             {channels.map((c) => (
               <span key={c.id} className="flex items-center gap-1 text-xs text-panda-muted bg-panda-surface2 rounded-full px-2 py-1">
-                <StatusBadge joined={c.joined} /> {c.name}
+                <StatusBadge joined={c.joined} />
+                <a
+                  href={telegramUrl(c.channel)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-panda-accent hover:underline"
+                  title={`Open ${c.channel} on Telegram`}
+                >
+                  {c.name}
+                </a>
               </span>
             ))}
           </div>

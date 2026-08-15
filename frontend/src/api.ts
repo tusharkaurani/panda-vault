@@ -1,4 +1,4 @@
-import type { Channel, Collection, DocumentsResponse, KeywordCount, SearchResult } from "./types";
+import type { Channel, Collection, DocumentsResponse, KeywordCount, RebuildJob, SearchResult } from "./types";
 
 class ApiError extends Error {
   status: number;
@@ -14,14 +14,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!res.ok) {
-    let detail = res.statusText;
+    let detail = "";
     try {
       const body = await res.json();
-      detail = body.detail || detail;
+      detail = body.detail || "";
     } catch {
       /* ignore */
     }
-    throw new ApiError(res.status, detail);
+    throw new ApiError(res.status, detail || res.statusText || `Request failed (HTTP ${res.status})`);
   }
   if (res.status === 204) return undefined as unknown as T;
   return res.json();
@@ -48,8 +48,9 @@ export const api = {
     remove: (id: string, force = false) =>
       request<void>(`/channels/${id}${force ? "?force=true" : ""}`, { method: "DELETE" }),
     join: (id: string) => request<{ joined: boolean }>(`/channels/${id}/join`, { method: "POST" }),
-    rebuild: (id: string) => request<{ rebuilding: boolean }>(`/channels/${id}/rebuild`, { method: "POST" }),
+    rebuild: (id: string) => request<{ rebuilding: boolean; jobId: string }>(`/channels/${id}/rebuild`, { method: "POST" }),
     status: (id: string) => request<{ joined: boolean }>(`/channels/${id}/status`),
+    rebuildJobs: () => request<{ jobs: RebuildJob[] }>("/channels/rebuild-jobs"),
   },
   collections: {
     tree: () => request<Collection[]>("/collections/tree"),

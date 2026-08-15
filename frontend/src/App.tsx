@@ -7,6 +7,8 @@ import Search from "./pages/Search";
 import Settings from "./pages/Settings";
 import Login from "./pages/Login";
 import { api } from "./api";
+import { NotificationProvider } from "./notifications/NotificationContext";
+import ToastContainer from "./notifications/ToastContainer";
 
 export default function App() {
   const [authorized, setAuthorized] = useState<boolean | null>(null);
@@ -28,14 +30,17 @@ export default function App() {
   if (!authorized) return <Login onSuccess={checkAuth} />;
 
   return (
-    <Layout>
-      <Routes>
-        <Route path="/" element={<Landing />} />
-        <Route path="/c/:collectionId" element={<CollectionView />} />
-        <Route path="/search" element={<Search />} />
-        <Route path="/settings" element={<Settings />} />
-        <Route path="*" element={<Landing />} />
-      </Routes>
-    </Layout>
+    <NotificationProvider>
+      <Layout>
+        <Routes>
+          <Route path="/" element={<Landing />} />
+          <Route path="/c/:collectionId" element={<CollectionView />} />
+          <Route path="/search" element={<Search />} />
+          <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<Landing />} />
+        </Routes>
+      </Layout>
+      <ToastContainer />
+    </NotificationProvider>
   );
 }

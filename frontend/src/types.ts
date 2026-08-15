@@ -49,3 +49,13 @@ export interface KeywordCount {
   word: string;
   count: number;
 }
+
+export interface RebuildJob {
+  id: string;
+  channelId: string;
+  channelName: string;
+  status: "running" | "done" | "error";
+  startedAt: number;
+  finishedAt: number | null;
+  error?: string | null;
+}
