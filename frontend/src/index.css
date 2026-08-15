@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --panda-bg: 247 248 250;
+  --panda-surface: 255 255 255;
+  --panda-surface2: 241 242 245;
+  --panda-border: 226 228 233;
+  --panda-text: 20 22 26;
+  --panda-muted: 107 114 128;
+  --panda-accent: 2 132 199;
+  --panda-accent2: 8 145 178;
+}
+
+.dark {
+  --panda-bg: 15 17 21;
+  --panda-surface: 22 25 34;
+  --panda-surface2: 30 34 45;
+  --panda-border: 42 47 61;
+  --panda-text: 232 234 237;
+  --panda-muted: 154 161 177;
+  --panda-accent: 102 204 255;
+  --panda-accent2: 34 211 238;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--panda-border));
+  border-radius: 999px;
+}

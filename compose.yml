@@ -1,0 +1,23 @@
+services:
+  panda-vault:
+    image: panda-vault
+    build:
+      context: .           # no upstream image is published — always build locally
+    container_name: panda-vault
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8811:8811"
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - TZ=UTC   # set to your local timezone
+    volumes:
+      - ./config:/app/config   # Telethon session (login persists across restarts)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://localhost:8811/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

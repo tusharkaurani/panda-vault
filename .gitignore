@@ -1,0 +1,18 @@
+# Runtime data / secrets — never commit
+.env
+config/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node / frontend build
+frontend/node_modules/
+frontend/dist/
+node_modules/
+dist/
+
+# Editor/OS cruft
+.DS_Store
+.vscode/
