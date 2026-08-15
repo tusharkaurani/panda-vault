@@ -9,6 +9,9 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,15 +28,25 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Determine image tags
         id: tags
         run: |
-          IMAGE=dockerpanda1206/panda-vault
-          TAGS="$IMAGE:latest"
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
-            TAGS="$TAGS,$IMAGE:$VERSION"
-          fi
+          IMAGES="dockerpanda1206/panda-vault ghcr.io/${{ github.repository }}"
+          TAGS=""
+          for IMAGE in $IMAGES; do
+            TAGS="${TAGS:+$TAGS,}$IMAGE:latest"
+            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+              VERSION="${GITHUB_REF#refs/tags/v}"
+              TAGS="$TAGS,$IMAGE:$VERSION"
+            fi
+          done
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
