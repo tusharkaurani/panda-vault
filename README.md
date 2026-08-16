@@ -66,6 +66,28 @@ required in addition to, the phone login above.
 | `TG_API_HASH` | yes | — | Telegram API app hash |
 | `TG_CACHE_REFRESH_SECONDS` | no | `1800` | Interval between background document-cache refresh cycles |
 
+## Upgrading to 2.0
+
+The document cache moved from `config/document_cache.json` to a SQLite
+database, `config/documents.db`. **Nothing to do — just pull the new image.**
+On first start the old file is imported automatically (a few seconds for
+~150k documents) and kept as `config/document_cache.json.bak`.
+
+Two things worth knowing:
+
+- **Rolling back to 1.x needs one manual step.** 1.x reads
+  `document_cache.json`, which 2.0 has renamed. Rename
+  `config/document_cache.json.bak` back to `config/document_cache.json`
+  first, or 1.x will start with an empty cache and rescan every channel
+  from Telegram.
+- **`/api/search` changed shape** if you script against it: results are now
+  paginated (`offset`/`limit`, with a `total`), each result carries flat
+  `collectionId`/`collectionName`/`channelId`/`channelName` instead of
+  nested objects, and queries shorter than 2 characters are rejected.
+
+Keep the `.bak` until you're satisfied with the upgrade; it's the fallback
+if `documents.db` is ever lost, and avoids a full re-scan.
+
 ## Usage
 
 1. **Settings → Channels → Add channel** — name, the channel ref
