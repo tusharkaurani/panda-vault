@@ -1,4 +1,4 @@
-import type { Channel, Collection, DocumentsResponse, KeywordCount, RebuildJob, SearchResult } from "./types";
+import type { Channel, Collection, DocumentsResponse, KeywordCount, RebuildJob, SearchResponse } from "./types";
 
 class ApiError extends Error {
   status: number;
@@ -79,6 +79,13 @@ export const api = {
     keywords: (id: string, limit = 8) =>
       request<{ keywords: KeywordCount[] }>(`/collections/${id}/keywords?limit=${limit}`),
   },
-  search: (q: string) => request<{ query: string; results: SearchResult[] }>(`/search?q=${encodeURIComponent(q)}`),
+  search: (q: string, opts: { offset?: number; limit?: number; signal?: AbortSignal } = {}) => {
+    const params = new URLSearchParams({ q });
+    if (opts.offset) params.set("offset", String(opts.offset));
+    if (opts.limit) params.set("limit", String(opts.limit));
+    // Note: an aborted request rejects with a DOMException named
+    // "AbortError", not an ApiError — callers must let that one through.
+    return request<SearchResponse>(`/search?${params}`, { signal: opts.signal });
+  },
   downloadUrl: (channelId: string, msgId: number) => `/api/download/${channelId}/${msgId}`,
 };

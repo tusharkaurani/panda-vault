@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Sun, Moon, Monitor } from "lucide-react";
+import Tooltip from "./Tooltip";
 import { applyTheme, getStoredTheme, ThemePref } from "../lib/theme";
 
 const ORDER: ThemePref[] = ["light", "dark", "system"];
@@ -30,12 +31,13 @@ export default function ThemeToggle() {
   const Icon = ICONS[pref];
 
   return (
-    <button
-      onClick={cycle}
-      className="p-2 rounded-lg border border-panda-border hover:border-panda-accent hover:text-panda-accent transition-colors shrink-0"
-      title={`Theme: ${LABELS[pref]} (click to change)`}
-    >
-      <Icon size={18} />
-    </button>
+    <Tooltip label={`Theme: ${LABELS[pref]} (click to change)`} side="bottom">
+      <button
+        onClick={cycle}
+        className="p-2 rounded-lg border border-panda-border hover:border-panda-accent hover:text-panda-accent transition-colors shrink-0"
+      >
+        <Icon size={18} />
+      </button>
+    </Tooltip>
   );
 }

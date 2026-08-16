@@ -3,7 +3,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from .. import store
+from .. import cache, store
 from ..telegram_client import download_stream
 
 router = APIRouter(prefix="/api/download", tags=["downloads"])
@@ -21,7 +21,12 @@ async def download(channel_id: str, msg_id: int):
         raise HTTPException(502, f"Could not reach Telegram: {e}")
 
     if not result:
-        raise HTTPException(404, "File not found")
+        # The listing is served from a cache that incremental refreshes only
+        # ever add to, so a message the channel has since deleted can still
+        # be on screen. Evict it here rather than leaving a link that keeps
+        # failing until the next full rescan.
+        cache.remove_document(channel_id, msg_id)
+        raise HTTPException(404, "This file is no longer available — it was deleted from the Telegram channel")
     gen, filename, size, mime = result
 
     # HTTP headers must be latin-1 encodable. Telegram filenames/captions can

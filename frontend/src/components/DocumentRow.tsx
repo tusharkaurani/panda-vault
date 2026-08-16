@@ -18,7 +18,7 @@ export default function DocumentRow({ doc, channelName }: { doc: DocumentOut; ch
   return (
     <a
       href={api.downloadUrl(doc.channelId!, doc.id)}
-      className="group flex items-center gap-3 rounded-lg border border-panda-border bg-panda-surface px-4 py-3 hover:border-panda-accent transition-colors"
+      className="doc-row group flex items-center gap-3 rounded-lg border border-panda-border bg-panda-surface px-4 py-3 hover:border-panda-accent transition-colors"
     >
       <Icon className="text-panda-muted shrink-0" size={20} />
       <div className="min-w-0 flex-1">

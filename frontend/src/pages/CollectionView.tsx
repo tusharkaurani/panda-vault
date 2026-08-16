@@ -11,7 +11,11 @@ import DocumentRow from "../components/DocumentRow";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
 import KeywordPills from "../components/KeywordPills";
+import FileCount from "../components/FileCount";
+import ScanProgress from "../components/ScanProgress";
 import StatusBadge from "../components/StatusBadge";
+import Tooltip from "../components/Tooltip";
+import { useNotifications } from "../notifications/NotificationContext";
 
 const PAGE_SIZE = 20;
 
@@ -29,6 +33,7 @@ function findPath(nodes: Collection[], id: string, trail: Collection[] = []): Co
 
 export default function CollectionView() {
   const { collectionId = "" } = useParams();
+  const { jobsByChannel, jobsCompleted } = useNotifications();
   const [tree, setTree] = useState<Collection[] | null>(null);
   const [docs, setDocs] = useState<DocumentOut[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
@@ -44,7 +49,7 @@ export default function CollectionView() {
 
   useEffect(() => {
     api.collections.tree().then(setTree).catch(() => {});
-  }, [collectionId]);
+  }, [collectionId, jobsCompleted]);
 
   const path = useMemo(() => (tree ? findPath(tree, collectionId) : null), [tree, collectionId]);
   const node = path ? path[path.length - 1] : null;
@@ -104,7 +109,7 @@ export default function CollectionView() {
       setDocErrors([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collectionId, node?.channelIds.length, sort, debouncedSearch]);
+  }, [collectionId, node?.channelIds.length, sort, debouncedSearch, jobsCompleted]);
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -164,37 +169,48 @@ export default function CollectionView() {
           {node.description && <p className="text-panda-muted text-sm mt-1">{node.description}</p>}
         </div>
         {channels.length === 1 && (
-          <div className="flex items-center gap-2">
-            <StatusBadge joined={channels[0].joined} />
+          <div className="flex flex-col items-end gap-1">
+            <div className="flex items-center gap-2">
+            <StatusBadge status={channels[0].status} job={jobsByChannel[channels[0].id]} />
             <span className="text-xs text-panda-muted">{channels[0].name}</span>
+            <FileCount count={channels[0].fileCount} />
             <CopyLinkButton url={telegramUrl(channels[0].channel)} />
-            <a
-              href={telegramUrl(channels[0].channel)}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-panda-muted hover:text-panda-accent"
-              title={`Open ${channels[0].channel} on Telegram`}
-            >
-              <ExternalLink size={14} />
-            </a>
+            <Tooltip label={`Open ${channels[0].channel} on Telegram`}>
+              <a
+                href={telegramUrl(channels[0].channel)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-panda-muted hover:text-panda-accent"
+              >
+                <ExternalLink size={14} />
+              </a>
+            </Tooltip>
+            </div>
+            {jobsByChannel[channels[0].id] && (
+              <div className="w-56">
+                <ScanProgress job={jobsByChannel[channels[0].id]} />
+              </div>
+            )}
           </div>
         )}
         {channels.length > 1 && (
           <div className="flex items-center gap-1.5 flex-wrap justify-end">
             {channels.map((c) => (
               <span key={c.id} className="flex items-center gap-1 text-xs text-panda-muted bg-panda-surface2 rounded-full px-2 py-1">
-                <StatusBadge joined={c.joined} />
+                <StatusBadge status={c.status} job={jobsByChannel[c.id]} />
                 <span>{c.name}</span>
+                <FileCount count={c.fileCount} />
                 <CopyLinkButton url={telegramUrl(c.channel)} size={12} />
-                <a
-                  href={telegramUrl(c.channel)}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="hover:text-panda-accent"
-                  title={`Open ${c.channel} on Telegram`}
-                >
-                  <ExternalLink size={12} />
-                </a>
+                <Tooltip label={`Open ${c.channel} on Telegram`}>
+                  <a
+                    href={telegramUrl(c.channel)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="hover:text-panda-accent"
+                  >
+                    <ExternalLink size={12} />
+                  </a>
+                </Tooltip>
               </span>
             ))}
           </div>
@@ -241,15 +257,16 @@ export default function CollectionView() {
               <option value="size_desc">Largest first</option>
               <option value="size_asc">Smallest first</option>
             </select>
-            <button
-              type="button"
-              onClick={() => loadDocs(true)}
-              disabled={refreshing}
-              className="flex items-center gap-1.5 rounded-lg border border-panda-border px-3 py-2 text-sm hover:border-panda-accent disabled:opacity-50"
-              title="Re-fetch from Telegram, bypassing cache"
-            >
-              <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} /> Refresh
-            </button>
+            <Tooltip label="Check Telegram now for new files">
+              <button
+                type="button"
+                onClick={() => loadDocs(true)}
+                disabled={refreshing}
+                className="flex items-center gap-1.5 rounded-lg border border-panda-border px-3 py-2 text-sm hover:border-panda-accent disabled:opacity-50"
+              >
+                <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} /> Refresh
+              </button>
+            </Tooltip>
           </form>
 
           <KeywordPills collectionId={collectionId} onSelect={onKeywordSelect} />

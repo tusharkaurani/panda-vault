@@ -2,9 +2,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 
-from .. import store
-from ..ext_filter import count_by_extensions
-from ..cache import get_cached_names
+from .. import cache, store
 from ..models import Collection, CollectionIn, CollectionMove, CollectionTreeNode, CollectionUpdate
 
 router = APIRouter(prefix="/api/collections", tags=["collections"])
@@ -39,21 +37,12 @@ def _is_descendant(node: Collection, target_id: str) -> bool:
     return False
 
 
-def _with_counts(nodes: List[Collection], channels_by_id: dict) -> List[CollectionTreeNode]:
+def _with_counts(nodes: List[Collection], counts: dict) -> List[CollectionTreeNode]:
     out = []
     for n in nodes:
-        children = _with_counts(n.children, channels_by_id)
+        children = _with_counts(n.children, counts)
         if n.channelIds:
-            # Count-only: pull raw cached filenames instead of full
-            # DocumentOut objects (via get_cached) — the tree endpoint is on
-            # the hot path (loaded on every collection navigation) and only
-            # needs a number per node, not fully reconstructed documents.
-            file_count = 0
-            for channel_id in n.channelIds:
-                channel = channels_by_id.get(channel_id)
-                names = get_cached_names(channel_id) or []
-                allowed = channel.allowedExtensions if channel else []
-                file_count += count_by_extensions(names, allowed)
+            file_count = sum(counts.get(cid) or 0 for cid in n.channelIds)
         else:
             file_count = sum(c.fileCount for c in children)
         out.append(
@@ -70,8 +59,13 @@ def _with_counts(nodes: List[Collection], channels_by_id: dict) -> List[Collecti
 @router.get("/tree", response_model=List[CollectionTreeNode])
 def get_tree():
     collections = store.load_collections()
-    channels_by_id = {c.id: c for c in store.load_channels()}
-    return _with_counts(collections, channels_by_id)
+    channels = store.load_channels()
+    # One grouped count for every channel up front. This endpoint is on the
+    # hot path — reloaded on every collection navigation — and previously
+    # walked each bound channel's entire filename list per node just to
+    # produce one integer each.
+    counts = cache.channel_counts([(c.id, c.allowedExtensions) for c in channels])
+    return _with_counts(collections, counts)
 
 
 @router.post("", response_model=Collection, status_code=201)

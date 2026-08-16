@@ -1,13 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { ChevronRight, ExternalLink, Home, Plus, RefreshCw, Pencil, Trash2, LogIn, RotateCw } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Channel, Collection } from "../types";
 import { telegramUrl } from "../lib/telegram";
+import { collectionsByChannel } from "../lib/collections";
+import ChannelCollections from "../components/ChannelCollections";
 import ChannelForm, { ChannelFormValues } from "../components/ChannelForm";
 import CollectionTreeEditor, { CollectionCreateForm } from "../components/CollectionTreeEditor";
 import CopyLinkButton from "../components/CopyLinkButton";
+import FileCount from "../components/FileCount";
+import ScanProgress from "../components/ScanProgress";
 import StatusBadge from "../components/StatusBadge";
+import Tooltip from "../components/Tooltip";
 import ErrorBanner from "../components/ErrorBanner";
 import EmptyState from "../components/EmptyState";
 import { useNotifications } from "../notifications/NotificationContext";
@@ -15,7 +20,7 @@ import { useNotifications } from "../notifications/NotificationContext";
 type Tab = "channels" | "collections";
 
 export default function Settings() {
-  const { pushToast } = useNotifications();
+  const { pushToast, jobsByChannel, jobsCompleted } = useNotifications();
   const [tab, setTab] = useState<Tab>("channels");
   const [channels, setChannels] = useState<Channel[] | null>(null);
   const [collections, setCollections] = useState<Collection[] | null>(null);
@@ -24,6 +29,10 @@ export default function Settings() {
   const [editingChannel, setEditingChannel] = useState<Channel | null>(null);
   const [addingRootCollection, setAddingRootCollection] = useState(false);
   const [busyChannelId, setBusyChannelId] = useState<string | null>(null);
+
+  // Reverse index of the collection tree, so each channel card can show
+  // where its documents surface in the library.
+  const channelCollections = useMemo(() => collectionsByChannel(collections ?? []), [collections]);
 
   async function refresh() {
     try {
@@ -36,9 +45,11 @@ export default function Settings() {
     }
   }
 
+  // Refetch on mount, and again whenever a scan/rebuild finishes — the
+  // counts and statuses it just changed are only computed server-side.
   useEffect(() => {
     refresh();
-  }, []);
+  }, [jobsCompleted]);
 
   async function createChannel(values: ChannelFormValues) {
     try {
@@ -96,15 +107,15 @@ export default function Settings() {
   }
 
   async function rebuildChannel(c: Channel) {
-    if (!confirm(`Rebuild the document cache for "${c.name}" from scratch?\n\nThis re-scans the channel's entire message history and replaces the existing cache — normally not needed since refreshes are incremental, but useful if the cache looks stale or wrong.`)) {
+    if (!confirm(`Rescan "${c.name}" from scratch?\n\nThis reads the channel's entire message history again and replaces the existing cache — normally not needed since refreshes are incremental, but useful if the cache looks stale or wrong.`)) {
       return;
     }
     setBusyChannelId(c.id);
     try {
       await api.channels.rebuild(c.id);
-      pushToast(`Rebuild started for "${c.name}" — you'll get notified when it's done.`, "info");
+      pushToast(`Rescan started for "${c.name}" — you'll get notified when it's done.`, "info");
     } catch (e) {
-      pushToast(e instanceof ApiError ? e.message : "Failed to start rebuild", "error");
+      pushToast(e instanceof ApiError ? e.message : "Failed to start rescan", "error");
     } finally {
       setBusyChannelId(null);
       refresh();
@@ -176,58 +187,70 @@ export default function Settings() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-medium">{c.name}</span>
-                      <StatusBadge joined={c.joined} />
+                      <FileCount count={c.fileCount} />
+                      <StatusBadge status={c.status} job={jobsByChannel[c.id]} />
                     </div>
                     <p className="text-xs text-panda-muted font-mono">{c.channel}</p>
                     {c.description && <p className="text-xs text-panda-muted mt-0.5">{c.description}</p>}
+                    {collections && <ChannelCollections collections={channelCollections[c.id] ?? []} />}
+                    {jobsByChannel[c.id] && <ScanProgress job={jobsByChannel[c.id]} />}
                   </div>
                   <div className="flex items-center gap-1 shrink-0">
                     {!c.joined && (
-                      <button
-                        onClick={() => checkJoin(c)}
-                        disabled={busyChannelId === c.id}
-                        className="flex items-center gap-1 p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2 disabled:opacity-50"
-                        title="Join / verify access"
-                      >
-                        {busyChannelId === c.id ? <RefreshCw size={16} className="animate-spin" /> : <LogIn size={16} />}
-                      </button>
+                      <Tooltip label="Join / verify access">
+                        <button
+                          onClick={() => checkJoin(c)}
+                          disabled={busyChannelId === c.id}
+                          className="flex items-center gap-1 p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2 disabled:opacity-50"
+                        >
+                          {busyChannelId === c.id ? <RefreshCw size={16} className="animate-spin" /> : <LogIn size={16} />}
+                        </button>
+                      </Tooltip>
                     )}
-                    <button
-                      onClick={() => rebuildChannel(c)}
-                      disabled={busyChannelId === c.id}
-                      className="flex items-center gap-1 p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2 disabled:opacity-50"
-                      title="Rebuild cache from scratch"
-                    >
-                      {busyChannelId === c.id ? <RefreshCw size={16} className="animate-spin" /> : <RotateCw size={16} />}
-                    </button>
+                    <Tooltip label={jobsByChannel[c.id] ? "Rescan already running" : "Rescan this channel from scratch"}>
+                      <button
+                        onClick={() => rebuildChannel(c)}
+                        disabled={busyChannelId === c.id || !!jobsByChannel[c.id]}
+                        className="flex items-center gap-1 p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2 disabled:opacity-50"
+                      >
+                        {busyChannelId === c.id || jobsByChannel[c.id] ? (
+                          <RefreshCw size={16} className="animate-spin" />
+                        ) : (
+                          <RotateCw size={16} />
+                        )}
+                      </button>
+                    </Tooltip>
                     <CopyLinkButton
                       url={telegramUrl(c.channel)}
                       size={16}
                       className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
                     />
-                    <a
-                      href={telegramUrl(c.channel)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
-                      title={`Open ${c.channel} on Telegram`}
-                    >
-                      <ExternalLink size={16} />
-                    </a>
-                    <button
-                      onClick={() => setEditingChannel(c)}
-                      className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
-                      title="Edit"
-                    >
-                      <Pencil size={16} />
-                    </button>
-                    <button
-                      onClick={() => deleteChannel(c)}
-                      className="p-1.5 rounded-md text-panda-muted hover:text-red-400 hover:bg-panda-surface2"
-                      title="Delete"
-                    >
-                      <Trash2 size={16} />
-                    </button>
+                    <Tooltip label={`Open ${c.channel} on Telegram`}>
+                      <a
+                        href={telegramUrl(c.channel)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                      >
+                        <ExternalLink size={16} />
+                      </a>
+                    </Tooltip>
+                    <Tooltip label="Edit channel">
+                      <button
+                        onClick={() => setEditingChannel(c)}
+                        className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                      >
+                        <Pencil size={16} />
+                      </button>
+                    </Tooltip>
+                    <Tooltip label="Delete channel">
+                      <button
+                        onClick={() => deleteChannel(c)}
+                        className="p-1.5 rounded-md text-panda-muted hover:text-red-400 hover:bg-panda-surface2"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </Tooltip>
                   </div>
                 </div>
               )

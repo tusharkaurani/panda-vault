@@ -3,11 +3,19 @@ import time
 import uuid
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 def new_id() -> str:
     return uuid.uuid4().hex[:12]
+
+
+def human_size(n: float) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}TB"
 
 
 class Channel(BaseModel):
@@ -18,6 +26,15 @@ class Channel(BaseModel):
     joined: bool = False
     allowedExtensions: List[str] = Field(default_factory=list)  # lowercase, no dot; empty = allow all
     created_at: float = Field(default_factory=time.time)
+
+
+class ChannelOut(Channel):
+    """Response-only shape for GET /api/channels — adds the computed, non
+    -persisted cache state the UI shows next to a channel's name."""
+
+    fileCount: int = 0
+    # not_joined | unscanned | scanning | rebuilding | ready | empty | error
+    status: str = "unscanned"
 
 
 class ChannelIn(BaseModel):
@@ -79,13 +96,20 @@ class DocumentOut(BaseModel):
     id: int
     name: str
     size: int
-    size_human: str
     date: str
     mime_type: Optional[str] = None
-    # Set by the collection/search routers when merging docs from multiple
-    # bound channels — not populated by telegram_client/cache, which stay
-    # channel-agnostic.
+    # Set by the cache query layer when returning docs (it's the partition
+    # key, so it's never stored per-row) — the routers rely on it to build
+    # download URLs.
     channelId: Optional[str] = None
+
+    @computed_field
+    @property
+    def size_human(self) -> str:
+        """Derived, never stored: persisting it cost ~12% of the old JSON
+        cache for a string that's a pure function of `size`. Still emitted
+        in every response, so the API contract is unchanged."""
+        return human_size(self.size)
 
 
 class PhoneIn(BaseModel):

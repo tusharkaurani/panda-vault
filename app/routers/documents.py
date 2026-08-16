@@ -1,12 +1,13 @@
+import asyncio
+from functools import lru_cache
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 
-from .. import cache, store
-from ..ext_filter import filter_by_extensions, filter_names_by_extensions
+from .. import cache, jobs, store
 from ..keywords import top_keywords
 from ..models import Collection
-from ..telegram_client import list_documents
+from ..telegram_client import sync_channel
 
 router = APIRouter(prefix="/api/collections", tags=["documents"])
 
@@ -38,18 +39,23 @@ async def get_keywords(collection_id: str, limit: int = 8):
         return {"keywords": []}
 
     channels_by_id = {c.id: c for c in store.load_channels()}
-    names: List[str] = []
-    for channel_id in node.channelIds:
-        channel = channels_by_id.get(channel_id)
-        if not channel:
-            continue
-        cached_names = cache.get_cached_names(channel.id)
-        if not cached_names:
-            continue
-        names.extend(filter_names_by_extensions(cached_names, channel.allowedExtensions))
-
+    scope = [
+        (cid, channels_by_id[cid].allowedExtensions) for cid in node.channelIds if cid in channels_by_id
+    ]
     limit = max(1, min(limit, 20))
-    return {"keywords": top_keywords(names, limit)}
+
+    # Tokenizing every filename in a large collection takes ~0.1s, and this
+    # endpoint fires on every collection navigation. Memoize on each
+    # channel's fetched_at so the result is reused until a scan or refresh
+    # actually changes the underlying names, and never goes stale.
+    stamp = tuple((cid, tuple(exts), cache.get_fetched_at(cid)) for cid, exts in scope)
+    return {"keywords": await asyncio.to_thread(_keywords_for, stamp, limit)}
+
+
+@lru_cache(maxsize=64)
+def _keywords_for(stamp: tuple, limit: int) -> List[dict]:
+    scope = [(cid, list(exts)) for cid, exts, _ in stamp]
+    return top_keywords(cache.iter_names(scope), limit)
 
 
 @router.get("/{collection_id}/documents")
@@ -73,43 +79,34 @@ async def get_documents(
     if not bound_channels:
         raise HTTPException(409, "None of this collection's channels exist anymore — rebind it in Settings")
 
-    docs = []
+    # Only talk to Telegram when there's a reason to: an explicit Refresh,
+    # or a channel nobody has ever scanned. Otherwise this is a pure
+    # database read.
     errors: List[str] = []
     for channel in bound_channels:
+        if not (refresh or not cache.has_channel(channel.id)):
+            continue
         try:
-            channel_docs = await list_documents(channel.id, channel.channel, force_refresh=refresh)
+            await sync_channel(channel.id, channel.channel, force_refresh=refresh)
         except RuntimeError as e:
             errors.append(f"{channel.name}: {e}")
-            continue
-        channel_docs = filter_by_extensions(channel_docs, channel.allowedExtensions)
-        for d in channel_docs:
-            d.channelId = channel.id
-        docs.extend(channel_docs)
 
-    if not docs and errors:
-        raise HTTPException(502, "; ".join(errors))
-
-    if search:
-        needle = search.lower()
-        docs = [d for d in docs if needle in d.name.lower()]
-
-    key_name, _, direction = sort.rpartition("_")
-    reverse = direction != "asc"
-    key_fn = {
-        "date": lambda d: d.date,
-        "name": lambda d: d.name.lower(),
-        "size": lambda d: d.size,
-    }.get(key_name, lambda d: d.date)
-    docs = sorted(docs, key=key_fn, reverse=reverse)
-
-    total = len(docs)
+    scope = [(c.id, c.allowedExtensions) for c in bound_channels]
     offset = max(0, offset)
     limit = max(1, min(limit, 100))
-    page = docs[offset : offset + limit]
+    # Extension allowlist, substring search, ordering and paging all happen
+    # in SQL — the router never holds more than one page of documents.
+    page, total = await asyncio.to_thread(
+        cache.query_documents, scope, search, sort, offset, limit
+    )
+    counts = cache.channel_counts(scope)
+
+    if not total and errors:
+        raise HTTPException(502, "; ".join(errors))
 
     return {
         "collection": node,
-        "channels": bound_channels,
+        "channels": [jobs.to_out(c, counts.get(c.id)) for c in bound_channels],
         "documents": page,
         "total": total,
         "offset": offset,

@@ -1,3 +1,12 @@
+export type ChannelStatus =
+  | "ready"
+  | "scanning"
+  | "rebuilding"
+  | "unscanned"
+  | "empty"
+  | "error"
+  | "not_joined";
+
 export interface Channel {
   id: string;
   name: string;
@@ -6,6 +15,9 @@ export interface Channel {
   joined: boolean;
   allowedExtensions: string[];
   created_at: number;
+  // Computed server-side from the document cache + any in-flight scan.
+  fileCount: number;
+  status: ChannelStatus;
 }
 
 export interface Collection {
@@ -39,10 +51,23 @@ export interface DocumentsResponse {
   errors?: string[];
 }
 
+// Deliberately flat: this used to carry the whole `Collection` (recursively,
+// children and all) plus the whole `Channel` for every single result, which
+// is what made an unpaginated search response reach tens of megabytes.
 export interface SearchResult {
-  collection: Collection;
-  channel: Channel;
+  collectionId: string;
+  collectionName: string;
+  channelId: string;
+  channelName: string;
   document: DocumentOut;
+}
+
+export interface SearchResponse {
+  query: string;
+  total: number;
+  offset: number;
+  limit: number;
+  results: SearchResult[];
 }
 
 export interface KeywordCount {
@@ -54,7 +79,10 @@ export interface RebuildJob {
   id: string;
   channelId: string;
   channelName: string;
+  kind: "scan" | "rebuild";
   status: "running" | "done" | "error";
+  scanned: number;
+  total: number | null;
   startedAt: number;
   finishedAt: number | null;
   error?: string | null;

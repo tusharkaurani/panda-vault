@@ -8,6 +8,7 @@ import {
   Link2,
   Link2Off,
 } from "lucide-react";
+import Tooltip from "./Tooltip";
 import type { Channel, Collection } from "../types";
 import { api, ApiError } from "../api";
 
@@ -170,20 +171,25 @@ function CollectionNode({
         </select>
 
         {!node.channelIds.length && (
-          <button
-            onClick={() => setAddingChild((v) => !v)}
-            className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
-            title="Add sub-collection"
-          >
-            <FolderPlus size={16} />
-          </button>
+          <Tooltip label="Add sub-collection">
+            <button
+              onClick={() => setAddingChild((v) => !v)}
+              className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+            >
+              <FolderPlus size={16} />
+            </button>
+          </Tooltip>
         )}
-        <button onClick={() => setEditing((v) => !v)} className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2" title="Edit">
-          <Pencil size={16} />
-        </button>
-        <button onClick={handleDelete} disabled={busy} className="p-1.5 rounded-md text-panda-muted hover:text-red-400 hover:bg-panda-surface2" title="Delete">
-          <Trash2 size={16} />
-        </button>
+        <Tooltip label="Edit collection">
+          <button onClick={() => setEditing((v) => !v)} className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2">
+            <Pencil size={16} />
+          </button>
+        </Tooltip>
+        <Tooltip label="Delete collection">
+          <button onClick={handleDelete} disabled={busy} className="p-1.5 rounded-md text-panda-muted hover:text-red-400 hover:bg-panda-surface2">
+            <Trash2 size={16} />
+          </button>
+        </Tooltip>
       </div>
 
       {error && <p className="text-xs text-red-400 mt-1" style={{ marginLeft: depth * 20 }}>{error}</p>}

@@ -9,17 +9,16 @@ import asyncio
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from telethon.tl.custom import QRLogin
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.types import DocumentAttributeFilename, InputMessagesFilterDocument
 
-from . import store
-from .cache import get_cached, get_max_id, set_cached
+from . import cache, store
 from .models import DocumentOut
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
@@ -29,6 +28,10 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 CACHE_REFRESH_SECONDS = int(os.environ.get("TG_CACHE_REFRESH_SECONDS", "1800"))  # 30 min
+_PROGRESS_EVERY = 100  # documents between partial cache writes / progress updates
+# Telegram's "Files" category: plain file attachments, excluding the media
+# it classifies separately (video/music/voice/GIF/round video).
+_FILE_FILTER = InputMessagesFilterDocument()
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 log = logging.getLogger("panda_vault.telegram_client")
@@ -131,14 +134,6 @@ def _get_filename(document) -> str:
     return f"unnamed.{(document.mime_type or '').split('/')[-1] or 'bin'}"
 
 
-def _human_size(n: float) -> str:
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}TB"
-
-
 async def _resolve_entity(channel_ref: str):
     ref = channel_ref.strip()
     m = _INVITE_RE.match(ref)
@@ -176,40 +171,85 @@ async def join_channel(channel_ref: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-async def _scan_documents(entity, min_id: int = 0) -> Tuple[List[DocumentOut], int]:
-    """Scan messages newer than min_id (0 = full history). A Telegram
-    channel's past never changes, so min_id lets a refresh only ask for
-    what's new since the last scan instead of re-reading everything."""
-    docs: List[DocumentOut] = []
+async def _scan_documents(entity, min_id: int = 0, on_chunk: Optional[Callable] = None) -> Tuple[int, int]:
+    """Scan messages newer than min_id (0 = full history), handing each
+    batch straight to on_chunk. A Telegram channel's past never changes,
+    so min_id lets a refresh only ask for what's new since the last scan
+    instead of re-reading everything.
+
+    The InputMessagesFilterDocument filter is what keeps this cheap:
+    Telegram returns only messages carrying a file, so a chat-heavy
+    channel costs one round trip per ~100 files rather than per ~100
+    messages. It also matches what this app indexes — plain files, not
+    videos/music/voice notes/GIFs, which Telegram classifies as separate
+    media categories and which never appear under this filter.
+
+    Documents are streamed out in batches of _PROGRESS_EVERY rather than
+    accumulated: a full scan of a large channel would otherwise hold every
+    document it has ever seen in memory at once. Returns
+    (documents_seen, max_id).
+
+    on_chunk(batch, max_id_so_far, total, seen_so_far) receives only the
+    documents since the previous call. `total` is the server's count of
+    matching messages — free, since Telethon populates it from the first
+    response — or None before the first batch lands.
+    """
+    batch: List[DocumentOut] = []
+    seen = 0
     max_id = min_id
-    async for message in client.iter_messages(entity, min_id=min_id):
+    it = client.iter_messages(entity, min_id=min_id, filter=_FILE_FILTER)
+    async for message in it:
         if message.id > max_id:
             max_id = message.id
-        if message.document:
-            doc = message.document
-            docs.append(
-                DocumentOut(
-                    id=message.id,
-                    name=_get_filename(doc),
-                    size=doc.size,
-                    size_human=_human_size(doc.size),
-                    date=message.date.strftime("%Y-%m-%d %H:%M"),
-                    mime_type=doc.mime_type,
-                )
+        if not message.document:
+            continue
+        doc = message.document
+        batch.append(
+            DocumentOut(
+                id=message.id,
+                name=_get_filename(doc),
+                size=doc.size,
+                date=message.date.strftime("%Y-%m-%d %H:%M"),
+                mime_type=doc.mime_type,
             )
-    return docs, max_id
+        )
+        seen += 1
+        if len(batch) >= _PROGRESS_EVERY:
+            if on_chunk:
+                on_chunk(batch, max_id, it.total, seen)
+            batch = []
+    if on_chunk:
+        on_chunk(batch, max_id, it.total, seen)
+    return seen, max_id
 
 
-def _merge_by_id(existing: List[DocumentOut], fresh: List[DocumentOut]) -> List[DocumentOut]:
-    by_id = {d.id: d for d in existing}
-    for d in fresh:
-        by_id[d.id] = d
-    return list(by_id.values())
+async def _server_file_count(entity) -> Optional[int]:
+    """Telegram's own count of file-carrying messages in this chat. limit=0
+    fetches no messages at all — the count rides along on the response — so
+    this costs one cheap call. None if Telegram didn't report a total."""
+    try:
+        return (await client.get_messages(entity, limit=0, filter=_FILE_FILTER)).total
+    except Exception as e:
+        log.warning("Could not read file count for entity: %s", e)
+        return None
 
 
-async def list_documents(
-    channel_id: str, channel_ref: str, force_refresh: bool = False, full_rebuild: bool = False
-) -> List[DocumentOut]:
+async def sync_channel(
+    channel_id: str,
+    channel_ref: str,
+    force_refresh: bool = False,
+    full_rebuild: bool = False,
+    on_progress: Optional[Callable] = None,
+) -> int:
+    """Bring a channel's cached listing up to date, returning how many
+    documents it holds afterwards.
+
+    Deliberately returns a count rather than the documents themselves:
+    callers want a page of 20 rows, and materializing a 66k-document
+    channel to serve them was the single most expensive thing this module
+    used to do. Read the documents back through cache.query_documents,
+    which pages in SQL.
+    """
     # No TTL check here on purpose: the cache is kept warm by the background
     # refresh loop below, so a cache hit is served regardless of age. This is
     # what keeps per-request Telegram API calls to (near) zero.
@@ -218,18 +258,18 @@ async def list_documents(
     # merge) so a corrupted/stale cache can be thrown away and rebuilt from
     # a clean full history scan — force_refresh alone only does an
     # incremental min_id-based top-up against the existing cache.
-    cached = None if full_rebuild else get_cached(channel_id)
-    if cached is not None and not force_refresh:
-        return cached
+    known = False if full_rebuild else cache.has_channel(channel_id)
+    if known and not force_refresh:
+        return cache.count_documents(channel_id)
 
     # A per-channel lock keeps two concurrent callers (e.g. the background
     # warm-up task and a user opening the collection at the same time) from both
     # running a full history scan against Telegram — the loser just waits
     # and gets served whatever the winner produced.
     async with _lock_for(channel_id):
-        cached = None if full_rebuild else get_cached(channel_id)
-        if cached is not None and not force_refresh:
-            return cached
+        known = False if full_rebuild else cache.has_channel(channel_id)
+        if known and not force_refresh:
+            return cache.count_documents(channel_id)
 
         try:
             entity = await _resolve_entity(channel_ref)
@@ -238,17 +278,62 @@ async def list_documents(
         except Exception as e:
             raise RuntimeError(f"Could not access channel: {e}")
 
+        if full_rebuild:
+            # Drop everything first so a rebuild really does start from a
+            # clean slate — otherwise rows the channel has since deleted
+            # would survive the "rebuild" that was meant to clear them.
+            cache.invalidate(channel_id)
+
         # First time we've ever seen this channel (or a full_rebuild): scan
         # the full history once and cache it — it never needs a full
         # re-scan again. Every later call (background refresh or manual
         # "Refresh") only asks Telegram for messages newer than the
         # highest ID we already have.
-        last_max_id = get_max_id(channel_id) if cached is not None else 0
-        fresh_docs, seen_max_id = await _scan_documents(entity, min_id=last_max_id)
+        last_max_id = cache.get_max_id(channel_id) if known else 0
 
-        docs = _merge_by_id(cached, fresh_docs) if cached is not None else fresh_docs
-        set_cached(channel_id, docs, max(seen_max_id, last_max_id))
-        return docs
+        if known:
+            # ...but an incremental scan can only ever *add*. Channels that
+            # prune old posts (auto-delete TTLs are common on newspaper
+            # channels) leave the cache holding messages that no longer
+            # exist: they stay listed in the UI and 404 on download, and no
+            # amount of refreshing removes them. Telegram's own file count
+            # is one cheap call and dropping below what we have cached is a
+            # reliable "something was deleted" signal — it counts a superset
+            # of what the scan keeps, never a subset. When it fires, throw
+            # the cache away and rescan the full history so the dead entries
+            # actually disappear.
+            cached_count = cache.count_documents(channel_id)
+            server_count = await _server_file_count(entity)
+            if server_count is not None and server_count < cached_count:
+                log.info(
+                    "Channel %s has %d file(s) on Telegram but %d cached — rescanning to drop deleted ones",
+                    channel_id,
+                    server_count,
+                    cached_count,
+                )
+                cache.invalidate(channel_id)
+                known, last_max_id = False, 0
+
+        def on_chunk(
+            batch: List[DocumentOut], partial_max_id: int, total: Optional[int], seen: int
+        ) -> None:
+            # Publish each batch as it arrives: collection counts and the
+            # document list read straight off the cache, so they climb as
+            # the scan runs instead of showing 0 until it completes.
+            #
+            # upsert_documents cannot advance the min_id cursor, which is
+            # what makes an interrupted scan safe — see set_cursor below.
+            cache.upsert_documents(channel_id, batch)
+            if on_progress:
+                on_progress(seen, total)
+
+        _, seen_max_id = await _scan_documents(entity, min_id=last_max_id, on_chunk=on_chunk)
+
+        # Only now that the scan has run to completion is it safe to move
+        # the cursor: messages arrive newest-first, so a partial scan is
+        # missing its older tail.
+        cache.set_cursor(channel_id, max(seen_max_id, last_max_id))
+        return cache.count_documents(channel_id)
 
 
 async def download_stream(channel_ref: str, msg_id: int):
@@ -273,7 +358,7 @@ async def _refresh_all_once() -> None:
         return
     for channel in store.load_channels():
         try:
-            await list_documents(channel.id, channel.channel, force_refresh=True)
+            await sync_channel(channel.id, channel.channel, force_refresh=True)
         except Exception as e:
             log.warning("Background refresh failed for channel %s: %s", channel.id, e)
         await asyncio.sleep(2)  # spread calls out instead of bursting Telegram

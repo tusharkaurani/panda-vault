@@ -5,7 +5,7 @@ Powers the pill row shown under a collection's search bar ("Economist",
 mostly made of without the user having to search first.
 
 Deliberately simple word-frequency counting over filenames already sitting
-in `cache.json` (no live Telegram calls, no NLP dependency): magazine/
+in the document cache (no live Telegram calls, no NLP dependency): magazine/
 newspaper/book dumps are highly repetitive by nature (the same publication
 name recurs in every issue's filename), so plain unigram counts with a
 small stopword/noise filter surface the right words with very little code.
@@ -16,7 +16,7 @@ feed the existing substring `search` box either way).
 """
 import re
 from collections import Counter
-from typing import List, TypedDict
+from typing import Iterable, List, TypedDict
 
 _EXT_RE = re.compile(r"\.[A-Za-z0-9]{2,5}$")
 # Split on anything that isn't a letter/digit — including underscore, which
@@ -49,7 +49,7 @@ class KeywordCount(TypedDict):
     count: int
 
 
-def top_keywords(names: List[str], limit: int = 8) -> List[KeywordCount]:
+def top_keywords(names: Iterable[str], limit: int = 8) -> List[KeywordCount]:
     counter: Counter = Counter()
     for name in names:
         stem = _EXT_RE.sub("", name)

@@ -1,5 +1,6 @@
 import { AlertCircle, CheckCircle2, Info, X } from "lucide-react";
 import { useNotifications } from "./NotificationContext";
+import Tooltip from "../components/Tooltip";
 
 const ICONS = { success: CheckCircle2, error: AlertCircle, info: Info };
 const COLORS = { success: "text-emerald-400", error: "text-red-400", info: "text-panda-accent" };
@@ -19,9 +20,11 @@ export default function ToastContainer() {
           >
             <Icon size={18} className={`shrink-0 mt-0.5 ${COLORS[t.kind]}`} />
             <span className="flex-1 text-panda-text leading-snug">{t.message}</span>
-            <button onClick={() => dismissToast(t.id)} className="shrink-0 text-panda-muted hover:text-panda-text">
-              <X size={14} />
-            </button>
+            <Tooltip label="Dismiss" side="bottom">
+              <button onClick={() => dismissToast(t.id)} className="shrink-0 text-panda-muted hover:text-panda-text">
+                <X size={14} />
+              </button>
+            </Tooltip>
           </div>
         );
       })}

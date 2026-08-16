@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Check, Copy } from "lucide-react";
+import Tooltip from "./Tooltip";
 
 export default function CopyLinkButton({
   url,
@@ -12,19 +13,20 @@ export default function CopyLinkButton({
 }) {
   const [copied, setCopied] = useState(false);
   return (
-    <button
-      type="button"
-      onClick={async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        await navigator.clipboard.writeText(url);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
-      className={className}
-      title="Copy Telegram link"
-    >
-      {copied ? <Check size={size} /> : <Copy size={size} />}
-    </button>
+    <Tooltip label={copied ? "Link copied" : "Copy Telegram link"}>
+      <button
+        type="button"
+        onClick={async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          await navigator.clipboard.writeText(url);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        }}
+        className={className}
+      >
+        {copied ? <Check size={size} /> : <Copy size={size} />}
+      </button>
+    </Tooltip>
   );
 }

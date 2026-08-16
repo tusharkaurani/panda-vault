@@ -1,5 +1,6 @@
 import { FormEvent, KeyboardEvent, useState } from "react";
 import { X } from "lucide-react";
+import Tooltip from "./Tooltip";
 import type { Channel } from "../types";
 
 export interface ChannelFormValues {
@@ -96,14 +97,15 @@ export default function ChannelForm({
               className="flex items-center gap-1 rounded-full bg-panda-surface2 border border-panda-border px-2 py-0.5 text-xs font-mono"
             >
               .{ext}
-              <button
-                type="button"
-                onClick={() => removeExtension(ext)}
-                className="text-panda-muted hover:text-red-400"
-                title={`Remove .${ext}`}
-              >
-                <X size={12} />
-              </button>
+              <Tooltip label={`Remove .${ext}`}>
+                <button
+                  type="button"
+                  onClick={() => removeExtension(ext)}
+                  className="text-panda-muted hover:text-red-400"
+                >
+                  <X size={12} />
+                </button>
+              </Tooltip>
             </span>
           ))}
           <input
