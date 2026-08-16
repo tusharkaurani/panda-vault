@@ -51,7 +51,12 @@ cd frontend && npm run dev                            # frontend
     timestamps in bulk (200 to the minute is normal), and both document lists
     page with LIMIT/OFFSET, so without a total order infinite scroll silently
     duplicates and skips rows.
-  - Substring search uses `instr()`, not `LIKE` — `LIKE` would make a typed
+  - Search splits the query on whitespace and requires **every** term to appear
+    in the filename, in any order (`_search_terms`), so "TH Ban" finds
+    "TH -Bangalore". Filenames separate words with spaces, dashes, dots and
+    underscores interchangeably, so one contiguous match would miss most of
+    what users type. A single-term query is still a plain substring match.
+  - Each term is matched with `instr()`, not `LIKE` — `LIKE` would make a typed
     `%`/`_` a wildcard.
   - A channel's `allowedExtensions` is applied at query time (`_scope_sql`), so
     editing it in Settings takes effect with no rescan or re-index.

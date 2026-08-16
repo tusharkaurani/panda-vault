@@ -72,7 +72,7 @@ export default function Layout({ children }: { children: ReactNode }) {
             <input
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Search documents across all channels…"
+              placeholder="Search documents — e.g. TH Ban"
               className="w-full bg-panda-surface border border-panda-border rounded-lg pl-9 pr-3 py-2 text-sm outline-none focus:border-panda-accent transition-colors"
             />
           </form>

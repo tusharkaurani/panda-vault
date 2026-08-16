@@ -278,7 +278,7 @@ export default function CollectionView() {
           )}
 
           {docs && docs.length === 0 && (
-            <EmptyState title="No documents found" hint="Nothing here yet, or your filter didn't match anything." />
+            <EmptyState title="No documents found" hint="Nothing here yet, or your filter didn't match — every word has to appear in the filename." />
           )}
 
           {docs && docs.length > 0 && (

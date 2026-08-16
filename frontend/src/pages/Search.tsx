@@ -119,7 +119,7 @@ export default function Search() {
       )}
 
       {!loading && !tooShort && results && results.length === 0 && q && (
-        <EmptyState title={`No documents matched "${q}"`} hint="Try a different keyword, or check that the relevant channel is joined in Settings." />
+        <EmptyState title={`No documents matched "${q}"`} hint="Every word has to appear in the filename, so try fewer words — or check that the relevant channel is joined in Settings." />
       )}
 
       {results && results.length > 0 && (

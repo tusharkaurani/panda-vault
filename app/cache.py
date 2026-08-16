@@ -151,6 +151,28 @@ def _scope_sql(scope: Sequence[ChannelScope]) -> Tuple[str, list]:
     return "(" + " OR ".join(branches) + ")", params
 
 
+# A query is split on whitespace and every term must appear somewhere in the
+# filename, in any order — so "TH Ban" finds "TH -Bangalore" and
+# "TH - School - Bangalore", the way searching in Telegram itself does.
+# Filenames separate the same words with spaces, dashes, dots and
+# underscores interchangeably, so requiring one contiguous match would miss
+# nearly everything a user types from memory.
+#
+# A single-term query behaves exactly as a plain substring match, which is
+# what it has always been.
+_MAX_SEARCH_TERMS = 8
+
+
+def _search_terms(search: str) -> List[str]:
+    """Split a query into the terms a filename must contain, all lowercase.
+
+    Longest first: SQLite short-circuits a chain of ANDs, so testing the
+    most selective term first rejects most rows on their first comparison.
+    """
+    terms = sorted({t for t in search.lower().split() if t}, key=len, reverse=True)
+    return terms[:_MAX_SEARCH_TERMS]
+
+
 def _row_to_doc(row: sqlite3.Row) -> DocumentOut:
     return DocumentOut(
         id=row["msg_id"],
@@ -358,14 +380,17 @@ def query_documents(
 ) -> Tuple[List[DocumentOut], int]:
     """One page of documents across `scope`, plus the total match count.
 
-    `search` is a case-insensitive substring match on the filename, using
-    instr() rather than LIKE so that a user typing `%` or `_` searches for
-    that literal character instead of it acting as a wildcard.
+    `search` is matched case-insensitively against the filename: every
+    whitespace-separated term must appear in it, in any order (see
+    _search_terms). Terms are matched with instr() rather than LIKE so that
+    a user typing `%` or `_` searches for that literal character instead of
+    it acting as a wildcard.
     """
     where, params = _scope_sql(scope)
-    if search:
+    params = list(params)
+    for term in _search_terms(search or ""):
         where += " AND instr(name_lower, ?) > 0"
-        params = params + [search.lower()]
+        params.append(term)
 
     order = _SORTS.get(sort, _SORTS[_DEFAULT_SORT])
     with _lock:
