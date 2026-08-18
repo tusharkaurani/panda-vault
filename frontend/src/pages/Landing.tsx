@@ -3,7 +3,8 @@ import { Link } from "react-router-dom";
 import { Home, Settings as SettingsIcon } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Collection } from "../types";
-import CollectionCard from "../components/CollectionCard";
+import BackToTop from "../components/BackToTop";
+import CollectionGrid from "../components/CollectionGrid";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
 
@@ -48,13 +49,9 @@ export default function Landing() {
         />
       )}
 
-      {collections && collections.length > 0 && (
-        <div className="grid grid-cols-1 min-[420px]:grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-          {collections.map((c) => (
-            <CollectionCard key={c.id} collection={c} />
-          ))}
-        </div>
-      )}
+      {collections && collections.length > 0 && <CollectionGrid collections={collections} parentId={null} />}
+
+      <BackToTop />
     </div>
   );
 }

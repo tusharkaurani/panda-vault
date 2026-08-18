@@ -83,6 +83,15 @@ class CollectionMove(BaseModel):
     parentId: Optional[str] = None  # None = move to root
 
 
+class CollectionReorder(BaseModel):
+    """Re-sorts one level of the tree. Sibling order *is* display order —
+    collections.json is a plain ordered list — so this rewrites that list
+    rather than storing a separate rank per node."""
+
+    parentId: Optional[str] = None  # None = the root level
+    orderedIds: List[str]
+
+
 class CollectionTreeNode(Collection):
     """Response-only shape for GET /api/collections/tree — adds computed,
     non-persisted counts on top of the stored Collection fields."""

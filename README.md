@@ -13,6 +13,7 @@ React + TypeScript + Tailwind CSS frontend, shipped as a single Docker image.
 - Browse documents from many Telegram channels through one clean web UI
 - Organize channels into an arbitrary-depth collection tree (e.g.
   `Magazines → Indian / Global`)
+- Reorder collections by dragging their cards, or with the arrow keys
 - Per-channel file-extension allowlists (e.g. only show `.pdf`/`.jpg`)
 - Cross-channel document search
 - Streamed downloads — never fully buffered on disk or in memory

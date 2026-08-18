@@ -63,6 +63,10 @@ export const api = {
     remove: (id: string) => request<void>(`/collections/${id}`, { method: "DELETE" }),
     move: (id: string, parentId: string | null) =>
       request<Collection>(`/collections/${id}/move`, { method: "POST", body: JSON.stringify({ parentId }) }),
+    // orderedIds must cover that level completely — the server rejects a
+    // partial order (409) rather than dropping the collections left out.
+    reorder: (parentId: string | null, orderedIds: string[]) =>
+      request<void>("/collections/reorder", { method: "POST", body: JSON.stringify({ parentId, orderedIds }) }),
     documents: (
       id: string,
       opts: { search?: string; sort?: string; refresh?: boolean; offset?: number; limit?: number } = {}

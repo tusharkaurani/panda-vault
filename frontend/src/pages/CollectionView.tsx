@@ -5,7 +5,8 @@ import { api, ApiError } from "../api";
 import type { DocumentOut, Channel, Collection } from "../types";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
 import { telegramUrl } from "../lib/telegram";
-import CollectionCard from "../components/CollectionCard";
+import BackToTop from "../components/BackToTop";
+import CollectionGrid from "../components/CollectionGrid";
 import CopyLinkButton from "../components/CopyLinkButton";
 import DocumentRow from "../components/DocumentRow";
 import EmptyState from "../components/EmptyState";
@@ -227,11 +228,7 @@ export default function CollectionView() {
           {node.children.length === 0 ? (
             <EmptyState title="This collection is empty" hint="Add sub-collections or bind a channel to it from Settings." />
           ) : (
-            <div className="grid grid-cols-1 min-[420px]:grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
-              {node.children.map((c) => (
-                <CollectionCard key={c.id} collection={c} />
-              ))}
-            </div>
+            <CollectionGrid collections={node.children} parentId={node.id} />
           )}
         </>
       )}
@@ -302,6 +299,8 @@ export default function CollectionView() {
           )}
         </>
       )}
+
+      <BackToTop />
     </div>
   );
 }

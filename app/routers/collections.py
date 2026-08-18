@@ -3,7 +3,14 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 
 from .. import cache, store
-from ..models import Collection, CollectionIn, CollectionMove, CollectionTreeNode, CollectionUpdate
+from ..models import (
+    Collection,
+    CollectionIn,
+    CollectionMove,
+    CollectionReorder,
+    CollectionTreeNode,
+    CollectionUpdate,
+)
 
 router = APIRouter(prefix="/api/collections", tags=["collections"])
 
@@ -118,6 +125,32 @@ def delete_collection(collection_id: str):
     if parent_list is None:
         raise HTTPException(404, "Collection not found")
     parent_list[:] = [n for n in parent_list if n.id != collection_id]
+    store.save_collections(collections)
+    return None
+
+
+@router.post("/reorder", status_code=204)
+def reorder_collections(body: CollectionReorder):
+    """Rewrite the sibling order of one level. `orderedIds` must be exactly a
+    permutation of that level's current members — anything else means the
+    caller is working from a tree that has since changed (a collection added,
+    deleted or moved from another tab), and applying a partial order would
+    silently drop or duplicate nodes."""
+    collections = store.load_collections()
+
+    if body.parentId:
+        parent = _find(collections, body.parentId)
+        if not parent:
+            raise HTTPException(404, "Parent collection not found")
+        siblings = parent.children
+    else:
+        siblings = collections
+
+    by_id = {n.id: n for n in siblings}
+    if len(body.orderedIds) != len(siblings) or set(body.orderedIds) != set(by_id):
+        raise HTTPException(409, "Collection order is out of date — reload and try again")
+
+    siblings[:] = [by_id[cid] for cid in body.orderedIds]
     store.save_collections(collections)
     return None
 
