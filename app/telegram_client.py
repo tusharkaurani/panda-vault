@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Callable, Dict, List, Optional, Tuple
 
 from telethon import TelegramClient
@@ -33,10 +34,23 @@ _PROGRESS_EVERY = 100  # documents between partial cache writes / progress updat
 # it classifies separately (video/music/voice/GIF/round video).
 _FILE_FILTER = InputMessagesFilterDocument()
 
-client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+# connection_retries=None retries a dropped connection forever. Telethon's
+# default (5 attempts, 1s apart) gives up after roughly five seconds of
+# network trouble and then stays down for good: it sets the sender to
+# disconnected, so every later call raises "Cannot send requests while
+# disconnected" and only restarting the process brings it back. This app is a
+# long-lived unattended container, so outlasting the outage is always what we
+# want.
+client = TelegramClient(
+    SESSION_PATH, API_ID, API_HASH, connection_retries=None, retry_delay=5
+)
 log = logging.getLogger("panda_vault.telegram_client")
 
 _refresh_task: Optional[asyncio.Task] = None
+_connect_lock = asyncio.Lock()
+_last_connect_failure: Optional[float] = None
+_stopping = False
+_RECONNECT_COOLDOWN = 5.0  # seconds between reconnect attempts while down
 _channel_locks: Dict[str, asyncio.Lock] = {}
 _login_phone: Optional[str] = None
 _qr: Optional[QRLogin] = None
@@ -58,20 +72,81 @@ async def start() -> None:
     """Connect only — never blocks on interactive login. First-run auth is
     driven through the /api/auth endpoints (web login flow) instead of a
     terminal prompt, since the app is meant to run unattended in a
-    container."""
-    await client.connect()
+    container.
+
+    A failure here is logged rather than raised: an unreachable Telegram at
+    boot would otherwise abort the lifespan and take the whole app down,
+    when ensure_connected() will pick the connection up on its own as soon
+    as the network is back.
+    """
+    await ensure_connected()
 
 
 async def stop() -> None:
+    global _stopping
+    _stopping = True
     await client.disconnect()
 
 
+async def ensure_connected() -> bool:
+    """True if the client is connected, reconnecting first if it isn't.
+
+    Something has to call connect() again after the connection dies —
+    Telethon's own retries can still run out (auth key rejected by the
+    server, a proxy refusing us, retries disabled), and nothing else in this
+    app ever reconnects after startup. Without this, one dropped connection
+    leaves every request failing with "Cannot send requests while
+    disconnected" until the container is restarted.
+    """
+    global _last_connect_failure
+    if _stopping:
+        return False
+    if client.is_connected():
+        return True
+    async with _connect_lock:
+        # Someone else may have reconnected while we waited for the lock.
+        if client.is_connected():
+            return True
+        # While Telegram is unreachable connect() blocks for the full connect
+        # timeout. The auth middleware calls this on every single request, so
+        # without a cooldown a dead network turns into a pile of requests all
+        # stalling on their own doomed connect. Only *failures* start the
+        # cooldown — a connection that drops seconds after a good connect
+        # still has to be allowed to come straight back.
+        if _last_connect_failure is not None and (
+            time.monotonic() - _last_connect_failure < _RECONNECT_COOLDOWN
+        ):
+            return False
+        try:
+            await client.connect()
+        except Exception as e:
+            _last_connect_failure = time.monotonic()
+            log.warning("Could not connect to Telegram: %s", e)
+            return False
+        _last_connect_failure = None
+        log.info("Connected to Telegram")
+        return True
+
+
 async def is_authorized() -> bool:
-    return client.is_connected() and await client.is_user_authorized()
+    if not await ensure_connected():
+        return False
+    try:
+        return await client.is_user_authorized()
+    except Exception as e:
+        # A connection that dies mid-check would otherwise surface as a 500
+        # from the auth middleware.
+        log.warning("Authorization check failed: %s", e)
+        return False
 
 
 async def send_code(phone: str) -> None:
     global _login_phone
+    # The /api/auth/* routes are exempt from the auth middleware, so they are
+    # the one group of endpoints that never passes through ensure_connected()
+    # on its way in — and they are exactly what a user reaches for when a lost
+    # connection has bounced them back to the login screen.
+    await ensure_connected()
     _login_phone = phone
     await client.send_code_request(phone)
 
@@ -81,6 +156,7 @@ async def sign_in_code(code: str) -> bool:
     password next (call sign_in_password)."""
     if not _login_phone:
         raise RuntimeError("Send a login code first")
+    await ensure_connected()
     try:
         await client.sign_in(_login_phone, code)
         return True
@@ -89,6 +165,7 @@ async def sign_in_code(code: str) -> bool:
 
 
 async def sign_in_password(password: str) -> None:
+    await ensure_connected()
     await client.sign_in(password=password)
 
 
@@ -99,6 +176,7 @@ async def qr_login_start() -> Tuple[str, float]:
     continuously — polling `wait()` itself per HTTP request would leave
     gaps where a scan could be missed. Returns (url, expires_epoch)."""
     global _qr, _qr_task, _qr_result
+    await ensure_connected()
     if _qr_task and not _qr_task.done():
         _qr_task.cancel()
     _qr = await client.qr_login()
