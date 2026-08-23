@@ -39,15 +39,26 @@ Library root the UI renders.
 - `integrations.py` — the catalog of integration *types* and which of them this
   vault has added (`config/integrations.json`). "Added" is a user decision, not
   a side effect of being configured: an added-but-empty integration still gets a
-  panel on the Integrations page and a node in the Library. An install with no `integrations.json` infers
+  page in Settings and a node in the Library. An install with no `integrations.json` infers
   its set once from existing channels/playlists/credentials, so upgrades don't
   land on an empty vault. **Adding a source type means adding a `CATALOG` entry
-  here and an icon in the UI's `ICONS` maps — everything else keys off
-  `sourceType`.**
+  here, an icon in the UI's `ICONS` map, and a panel in the UI's `PANELS` map —
+  everything else keys off `sourceType`.**
+  A stored entry is `{"id", "name"}`, where `name` is the label the user gave
+  that integration's root node in the Library and `None` means "use the
+  catalog's". Read it through `name_for`, never off the entry — the catalog
+  name stays reachable as `default_name` (`defaultName` over the API), which is
+  what the Add menu offers and what identifies the *type* after a rename. The
+  id is the only thing anything else keys on, so renaming touches a label and
+  nothing else.
 - `store.py` — JSON persistence for `config/channels.json`, `playlists.json`,
   `integrations.json` and `collections.json`. Atomic write + `threading.Lock`. Always go through it, never
   open those files directly. `_migrate_source_fields` lazily upgrades the legacy
-  `channelId`/`channelIds` binding fields to `sourceIds` + `sourceType` on read.
+  `channelId`/`channelIds` binding fields to `sourceIds` + `sourceType` on read;
+  `load_integrations` does the same for the legacy bare list of ids, which
+  predates renameable root nodes. Both upgrade in memory and persist on the
+  next write. `load_integrations` returning `None` (never decided) is not the
+  same as `[]` (all removed) — only the first infers a set.
 - `sources.py` — resolves a collection's `sourceIds` to the actual channels or
   playlists and builds the `(id, allowedExtensions)` scope every cache read wants.
   Routers must not rebuild that scope by hand.
@@ -96,18 +107,99 @@ Library root the UI renders.
   - Startup imports a legacy `document_cache.json` once, then renames it to
     `.bak` — kept, never deleted, as the fallback if the db is lost. A corrupt
     db is quarantined and rebuilt from that backup.
+  - `stream_health` (v4) records how each *stream URL* last responded, keyed
+    by the URL itself. It cannot be a column on `documents`: an M3U refresh
+    swaps the whole partition and `msg_id` is only an ordinal within the
+    current snapshot, so anything per-row would be destroyed nightly. Reads
+    left-join it (`_JOIN_HEALTH`), which is why `_DOC_COLUMNS` is qualified
+    with `d.` — `url` exists in both tables and an unqualified reference is an
+    ambiguous-column error. `prune_stream_health` drops rows no playlist lists
+    any more, since a URL-keyed table can't otherwise know an entry was
+    dropped.
+  - `source_health` (v3) records how each source's last *fetch* went —
+    status, error, attempt/success times and a consecutive-failure streak,
+    via `record_fetch`. Deliberately not columns on `channels_meta`: the mere
+    existence of a `channels_meta` row is what `has_source` reads as "this
+    source has been scanned", so recording a failed *first* fetch there would
+    make a source that has never produced a row look scanned-and-empty.
+    Whole new tables go in `_MIGRATION_TABLES`, the sibling of `_MIGRATIONS`
+    for statements that have no column to guard on.
 - `m3u.py` — the m3u source type's counterpart to `telegram_client`: fetch, parse,
   sync. A playlist is a *snapshot*, not a history — there is no cursor and no
   incremental mode, so every sync is a full `replace_source_documents` swap and
-  entries the provider dropped just stop existing. `#EXTGRP` is sticky (it applies
+  entries the provider dropped just stop existing. Because that swap is
+  destructive and irreversible, two guards sit in front of it and both are
+  load-bearing:
+  - `_validate_body` rejects a 200 that isn't a playlist. `parse` is
+    deliberately forgiving — *any* non-`#` line is a stream URL — so an
+    expired-subscription or login page doesn't fail, it silently becomes a
+    few dozen channels whose URLs are fragments of HTML, which then replace
+    the real snapshot.
+  - `_shrank` refuses a snapshot below `M3U_SHRINK_GUARD_RATIO` of the
+    previous one, keeping the old copy. Only the rescan endpoint's
+    `?force=true` (`allow_shrink`) gets past it — a scheduled refresh must
+    never be the thing that throws away data the user can't get back.
+
+  Failures are typed (`PlaylistUnavailable` / `PlaylistInvalid` /
+  `PlaylistShrank`, all `RuntimeError` subclasses so existing handlers still
+  catch them) and each carries the `cache.FETCH_*` status it records.
+  `sync_playlist` records *every* attempt that reaches the network, so the
+  scheduler, a manual rescan and a collection open all leave the same trail. `#EXTGRP` is sticky (it applies
   to every following entry until changed); `group-title` still beats it. The
   #EXTINF attribute/title split is on the first comma *outside* quotes, because
   `group-title="News, Sport"` is common.
+- `health.py` — probing the stream URLs *inside* a playlist, as opposed to the
+  playlist URL itself. Separate from `m3u.py` because it runs on its own
+  schedule, keys on URLs rather than playlists, and its results outlive any
+  snapshot. Everything about its shape is about not doing work on a Pi:
+  results are keyed by URL so a stream listed in five playlists is probed
+  once; a single TCP connect per `(host, port)` condemns a dead provider's
+  whole catalogue without probing any of it (the common failure is wholesale,
+  not scattered); and a wall-clock budget stops a sweep early, with leftovers
+  carrying to the next run least-recently-checked first. The probe itself is a
+  ladder — HEAD, then a ranged GET when the server won't do HEAD, then an
+  `#EXTM3U` check for `.m3u8` so a 200-with-an-HTML-error-page isn't read as
+  healthy. **The binding constraint is provider rate-limiting, not the
+  hardware**, hence `PER_HOST` mattering more than `CONCURRENCY`. One failure
+  marks a URL `unknown`, two consecutive ones `unavailable` (`_verdict`), so a
+  bad night doesn't turn a library red. Probes run on their **own**
+  ThreadPoolExecutor — asyncio's shared default pool also serves cache reads
+  and playlist syncs, and an hour-long sweep would starve them.
 - `refresh.py` — the periodic background refresh for *all* source types. Used to
   live in `telegram_client`; it moved so a second source type didn't need either a
   competing loop or an import of `m3u` from the Telegram module. Not tracked in
   `jobs.py` — routine housekeeping shouldn't fire notifications every half hour.
-- `jobs.py` — scan/rebuild tracking, **in-memory only, never persisted**. Exists
+  It also owns *when* the stream check runs (`_sweep_streams`), immediately
+  after the playlist refresh and for a specific reason: many free playlist
+  URLs carry an expiring session token, so probing yesterday's snapshot would
+  report the stale token as a dead channel. Like the refresh, the nightly
+  sweep is untracked in `jobs.py`; only a user-triggered one gets a job.
+  A **scheduler, not a sweep**: it wakes on a short tick (`REFRESH_TICK_SECONDS`)
+  and asks each source whether it is due. Telegram keeps one cadence for all
+  channels (`TG_CACHE_REFRESH_SECONDS`, incremental and usually free); playlists
+  are due individually, per `Playlist.refreshMinutes` or `M3U_REFRESH_MINUTES`,
+  because each one is a full re-download. Anything on a daily-or-slower interval
+  waits for the nightly window (`PANDA_NIGHTLY_HOUR`) unless it's overdue by
+  `_OVERDUE_FACTOR`, which is what stops a machine that's asleep at 3am from
+  never refreshing at all. Due-ness reads `source_health.last_attempt_at`, **not**
+  `fetched_at`: the latter only moves when documents are written, so a dead URL
+  would look permanently overdue and be retried every tick. Consecutive failures
+  back the interval off, capped so it still recovers on its own.
+- `jobs.py` — scan/rebuild tracking, **in-memory only, never persisted**.
+  A `HEALTH` job is always recorded against a synthetic id (`health_source`),
+  never a real playlist's — that keeps it out of the playlist's status pill
+  and out of the UI's `jobsBySource` map (which is keyed by `sourceId` and
+  drives "a scan is running here"), while still reaching the notification
+  bell. `source_status` additionally ignores `HEALTH` jobs outright.
+  `source_status` is the single source of truth for the status pill and now
+  weighs persisted fetch health above the cached count: without it a playlist
+  whose URL died weeks ago still reported "ready" off the snapshot it took
+  before it broke, because a count alone can't tell fresh from abandoned. It
+  adds `stale` (URL not answering, cached entries still served), `invalid`
+  (answering with something that isn't a playlist) and `needs_review` (a
+  snapshot refused for shrinking). A single failure is a blip — `failed` only
+  turns the pill after `_STALE_AFTER`, while the deterministic ones show at
+  once. Telegram never has a health row, so that lookup is skipped for it. Exists
   outside routers so the source list endpoints and the documents endpoint can't
   disagree about a source's status. Keyed on `sourceId`, and structural over
   `.id`/`.name`/`.allowedExtensions` so a channel and a playlist are both a Source.
@@ -148,17 +240,59 @@ Library root the UI renders.
   kinds interleaved, so the choice can't be made once per page.
 - The Library root is virtual: not a stored collection, but one card per
   connected integration (`pages/Landing.tsx`), each opening `/s/:sourceType`.
+  Those root nodes are user-named, so nothing may hardcode "Telegram"/"M3U" as
+  a display label — read `useIntegrations().byId(type)?.name`. `defaultName` is
+  for naming the *type* (the Add menu, the "what kind is this" hint beside a
+  renamed title), never for labelling a node.
   A collection grid must only ever hold one tree — sibling order is
   per-integration, and a root-level reorder has to name its `sourceType` or the
   server rejects it as a partial order (409).
-- Settings has exactly **two** tabs, Integrations and Collections. An added
-  integration becomes a collapsible panel on the Integrations page holding its
-  own sources — deliberately not a tab, so the strip doesn't grow with every
-  new source type.
+- Settings has exactly **two** tabs, Integrations and Collections — the strip
+  must not grow with every new source type. They are **routes**, not `?tab=`
+  state: `/settings/integrations` and `/settings/collections?type=<id>`, with
+  `/settings` redirecting to the first. That's what makes each tab its own
+  history entry and its own breadcrumb crumb, and it's how an integration page
+  links back at its own tree. Everything under `pages/settings/`:
+  `SettingsLayout` (breadcrumb + title + tab strip + `<Outlet/>`) and one file
+  per tab. `IntegrationSettings` is a **sibling** route, not a child — it has
+  its own header and must not inherit the strip.
+- The Integrations tab is a *registry only*: a list of what's added, each row
+  linking to `/settings/integrations/:sourceType`, plus an `AddIntegrationMenu`
+  dropdown offering what's left. A source type's own sources are managed on that
+  page, never inline in the list — two integrations expanded side by side is
+  what this replaced. It deliberately fetches nothing (the catalog is already in
+  context); only `CollectionsSettings` loads channels/playlists/tree.
+- Breadcrumbs go through `components/Breadcrumbs.tsx` and are rooted at their
+  **section**, not at a universal home. `Library` leads a trail only where it is
+  a genuine ancestor (`/`, `/s/:type`, `/c/:id`); a Settings trail starts at
+  `Settings`, because Settings is a peer of the Library, never a child of it.
+  Getting home is the header logo's job — it's on screen either way. A crumb
+  with no `to` is a level with no page of its own (`Settings` is one, since it
+  only redirects); the last crumb is never a link.
+- A source type's settings body is a panel under `components/integrations/`,
+  registered in `IntegrationSettings`'s `PANELS` map and taking
+  `IntegrationPanelProps`. The panel owns its source list and fetches it itself;
+  the page above only supplies the catalog entry, the `sourceId → collections`
+  index, and an `onChanged` to re-pull both. A type with no panel still gets a
+  page — it just has nothing to configure.
 - Lucide icons are `forwardRef` objects: calling one as a function
   (`Icon({...})`) throws at runtime and **TypeScript does not catch it**, since
   `ForwardRefExoticComponent` is typed callable. Always render as JSX; the
   integration icons go through `components/IntegrationIcon.tsx`.
+- Stream reachability shows as a `StreamHealthDot` beside each entry's name
+  and as a filter above the list. An `unavailable` row is dimmed, never
+  disabled — a probe can be wrong (geo-blocks, providers that only answer real
+  players), so the link stays clickable. `StreamCheckPanel` sits above the
+  playlist list rather than on each row, because the check is vault-wide and
+  URL-keyed; per-playlist buttons would imply an independence that isn't real.
+- A playlist's row in `M3uPanel` carries a `PlaylistHealthNote`, which reads
+  the server-computed `status` rather than re-deriving from `fetchStatus` /
+  `failStreak` — so the note and the `StatusBadge` can never disagree about
+  whether a failure is worth mentioning. "Replace anyway" is the only path to
+  `rescan(id, force)`, and it confirms with the numbers first.
+- Relative timestamps go through `lib/time.ts`: `timeAgo` for browser
+  milliseconds, `timeAgoUnix` for the seconds every API field carries. Mixing
+  them silently reports "56y ago".
 - Every M3U logo URL goes through `lib/logos.ts`. It upgrades `http:`→`https:`
   on an https page (mixed content is dropped silently otherwise) and is the one
   seam a future logo cache/proxy would plug into.
