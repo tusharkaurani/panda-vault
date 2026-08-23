@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { ExternalLink } from "lucide-react";
+import { ExternalLink, Play } from "lucide-react";
 import type { DocumentOut } from "../types";
 import { initialsFor, logoSrc } from "../lib/logos";
 import CopyLinkButton from "./CopyLinkButton";
 import StreamHealthDot from "./StreamHealthDot";
+import StreamPlayerModal from "./StreamPlayerModal";
 import Tooltip from "./Tooltip";
 
 /** The extension the stream URL ends in — the same thing a playlist's
@@ -21,6 +22,7 @@ function streamExt(url?: string | null): string | null {
  *  group where a file icon and byte count would be. */
 export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; sourceName?: string }) {
   const [logoFailed, setLogoFailed] = useState(false);
+  const [playerOpen, setPlayerOpen] = useState(false);
   const logo = logoFailed ? null : logoSrc(doc.logo);
   const ext = streamExt(doc.url);
 
@@ -75,12 +77,27 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
 
       <div className="flex items-center gap-1 shrink-0">
         {doc.url && (
-          <CopyLinkButton
-            url={doc.url}
-            label="Copy stream URL"
-            size={16}
-            className="p-1 rounded-md text-panda-muted hover:text-panda-accent"
-          />
+          <>
+            <Tooltip label="Play in browser">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setPlayerOpen(true);
+                }}
+                className="p-1 rounded-md text-panda-muted hover:text-panda-accent"
+              >
+                <Play size={16} />
+              </button>
+            </Tooltip>
+            <CopyLinkButton
+              url={doc.url}
+              label="Copy stream URL"
+              size={16}
+              className="p-1 rounded-md text-panda-muted hover:text-panda-accent"
+            />
+          </>
         )}
         <Tooltip label="Open the stream">
           <span className="p-1 text-panda-muted group-hover:text-panda-accent">
@@ -88,6 +105,9 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
           </span>
         </Tooltip>
       </div>
+      {playerOpen && doc.url && (
+        <StreamPlayerModal url={doc.url} name={doc.name} onClose={() => setPlayerOpen(false)} />
+      )}
     </a>
   );
 }
