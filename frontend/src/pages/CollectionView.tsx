@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { ChevronRight, ExternalLink, Home, Loader2, RefreshCw } from "lucide-react";
+import { useParams } from "react-router-dom";
+import { ExternalLink, Home, LayoutGrid, List, Loader2, RefreshCw } from "lucide-react";
 import { api, ApiError } from "../api";
-import type { DocumentOut, Collection, Source } from "../types";
+import type { DocumentOut, Collection, GroupSummary, HealthTotals, Source } from "../types";
 import { isPlaylist } from "../types";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
+import { useIntegrations } from "../integrations/IntegrationsContext";
 import { telegramUrl } from "../lib/telegram";
+import { findPath } from "../lib/collections";
+import Breadcrumbs from "../components/Breadcrumbs";
 import BackToTop from "../components/BackToTop";
 import CollectionGrid from "../components/CollectionGrid";
 import CopyLinkButton from "../components/CopyLinkButton";
+import GroupedChannels from "../components/GroupedChannels";
 import ItemRow from "../components/ItemRow";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
@@ -21,24 +25,22 @@ import { useNotifications } from "../notifications/NotificationContext";
 
 const PAGE_SIZE = 20;
 
-function findPath(nodes: Collection[], id: string, trail: Collection[] = []): Collection[] | null {
-  for (const n of nodes) {
-    const next = [...trail, n];
-    if (n.id === id) return next;
-    if (n.children.length) {
-      const found = findPath(n.children, id, next);
-      if (found) return found;
-    }
-  }
-  return null;
+/** " (1,204)" for a known count, "" for a state with none — an option
+ *  reading "Not working" is better than one reading "Not working (0)". */
+function count(n?: number): string {
+  return n ? ` (${n.toLocaleString()})` : "";
 }
 
 export default function CollectionView() {
   const { collectionId = "" } = useParams();
-  const { jobsBySource, jobsCompleted } = useNotifications();
+  const { jobsBySource, jobsCompleted, healthJob } = useNotifications();
+  const { byId } = useIntegrations();
   const [tree, setTree] = useState<Collection[] | null>(null);
   const [docs, setDocs] = useState<DocumentOut[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
+  // Grouped mode's data: real per-category counts from the server, not a
+  // client-side tally over whatever page of `docs` happened to be loaded.
+  const [groups, setGroups] = useState<GroupSummary[] | null>(null);
   const [sources, setSources] = useState<Source[]>([]);
   const [docErrors, setDocErrors] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -47,6 +49,13 @@ export default function CollectionView() {
   // null = "the user hasn't chosen", so the default can depend on what
   // kind of collection this turns out to be once the tree loads.
   const [sort, setSort] = useState<string | null>(null);
+  // Reachability filter. Only meaningful for m3u, and reset when navigating
+  // to another collection (see the effect below) so a filter set on one
+  // playlist doesn't silently hide another's contents.
+  const [health, setHealth] = useState<string>("");
+  const [healthTotals, setHealthTotals] = useState<HealthTotals>({});
+  // m3u only — grouped-by-category is the default, flat list is the fallback.
+  const [viewMode, setViewMode] = useState<"grouped" | "list">("grouped");
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -63,6 +72,7 @@ export default function CollectionView() {
   // affordance all differ.
   const isM3u = node?.sourceType === "m3u";
 
+  const grouped = isM3u && viewMode === "grouped";
   // Every entry in a playlist snapshot carries the same fetch timestamp, so
   // date_desc would order by ordinal *descending* — the playlist backwards.
   // Ascending ordinals are the order the provider actually wrote.
@@ -78,11 +88,13 @@ export default function CollectionView() {
         refresh,
         offset: 0,
         limit: PAGE_SIZE,
+        health: health || undefined,
       });
       setDocs(res.documents);
       setTotal(res.total);
       setSources(res.sources);
       setDocErrors(res.errors ?? []);
+      setHealthTotals(res.healthTotals ?? {});
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Failed to load documents");
       setDocs([]);
@@ -101,6 +113,7 @@ export default function CollectionView() {
         sort: effectiveSort,
         offset: docs.length,
         limit: PAGE_SIZE,
+        health: health || undefined,
       });
       setDocs((prev) => (prev ? [...prev, ...res.documents] : res.documents));
       setTotal(res.total);
@@ -111,19 +124,73 @@ export default function CollectionView() {
     }
   }
 
+  async function loadGroups(refresh = false, searchOverride?: string) {
+    setError(null);
+    if (refresh) setRefreshing(true);
+    try {
+      const res = await api.collections.groups(collectionId, {
+        search: (searchOverride ?? debouncedSearch) || undefined,
+        refresh,
+        health: health || undefined,
+      });
+      setGroups(res.groups);
+      setSources(res.sources);
+      setDocErrors(res.errors ?? []);
+      setHealthTotals(res.healthTotals ?? {});
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Failed to load categories");
+      setGroups([]);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
   useEffect(() => {
-    if (node?.sourceIds.length) {
+    if (!node?.sourceIds.length) {
       setDocs(null);
       setTotal(null);
-      loadDocs();
+      setGroups(null);
+      setSources([]);
+      setDocErrors([]);
+      return;
+    }
+    if (grouped) {
+      setGroups(null);
+      loadGroups();
     } else {
       setDocs(null);
       setTotal(null);
-      setSources([]);
-      setDocErrors([]);
+      loadDocs();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collectionId, node?.sourceIds.length, effectiveSort, debouncedSearch, jobsCompleted]);
+  }, [collectionId, node?.sourceIds.length, grouped, effectiveSort, debouncedSearch, health, jobsCompleted]);
+
+  // A filter that made sense in one collection would silently hide most of
+  // the next one, so it doesn't survive navigation.
+  useEffect(() => setHealth(""), [collectionId]);
+
+  // Follow a running stream check. Only the tallies are re-read: re-fetching
+  // the documents would replace an infinite-scrolled list with its first
+  // page every few seconds. The dots on the rows themselves catch up when
+  // the check finishes, which bumps jobsCompleted and reloads properly.
+  useEffect(() => {
+    if (!healthJob || !isM3u || !node?.sourceIds.length) return;
+    let cancelled = false;
+    async function tick() {
+      try {
+        const res = await api.collections.health(collectionId);
+        if (!cancelled) setHealthTotals(res.healthTotals ?? {});
+      } catch {
+        // transient — the next tick retries
+      }
+    }
+    tick();
+    const t = setInterval(tick, 8000);
+    return () => {
+      cancelled = true;
+      clearInterval(t);
+    };
+  }, [healthJob, isM3u, collectionId, node?.sourceIds.length]);
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -141,12 +208,14 @@ export default function CollectionView() {
 
   function onSearchSubmit(e: React.FormEvent) {
     e.preventDefault();
-    loadDocs(false, search);
+    if (grouped) loadGroups(false, search);
+    else loadDocs(false, search);
   }
 
   function onKeywordSelect(word: string) {
     setSearch(word);
-    loadDocs(false, word);
+    if (grouped) loadGroups(false, word);
+    else loadDocs(false, word);
   }
 
   if (!tree) {
@@ -164,25 +233,13 @@ export default function CollectionView() {
 
   return (
     <div className="flex flex-col gap-6">
-      <nav className="flex items-center gap-1 text-sm text-panda-muted flex-wrap">
-        <Link to="/" className="flex items-center gap-1 hover:text-panda-accent">
-          <Home size={14} /> Library
-        </Link>
-        <span className="flex items-center gap-1">
-          <ChevronRight size={14} />
-          <Link to={`/s/${node.sourceType}`} className="hover:text-panda-accent">
-            {node.sourceType === "telegram" ? "Telegram" : "M3U"}
-          </Link>
-        </span>
-        {path!.map((p) => (
-          <span key={p.id} className="flex items-center gap-1">
-            <ChevronRight size={14} />
-            <Link to={`/c/${p.id}`} className={p.id === node.id ? "text-panda-text font-medium" : "hover:text-panda-accent"}>
-              {p.name}
-            </Link>
-          </span>
-        ))}
-      </nav>
+      <Breadcrumbs
+        items={[
+          { label: "Library", to: "/", icon: <Home size={14} /> },
+          { label: byId(node.sourceType)?.name ?? node.sourceType, to: `/s/${node.sourceType}` },
+          ...path!.map((p) => ({ label: p.name, to: `/c/${p.id}` })),
+        ]}
+      />
 
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
@@ -296,32 +353,81 @@ export default function CollectionView() {
               placeholder={isM3u ? "Filter channels in this collection…" : "Filter documents in this collection…"}
               className="flex-1 min-w-[200px] bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
             />
-            <select
-              value={effectiveSort}
-              onChange={(e) => setSort(e.target.value)}
-              className="bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
-            >
-              {isM3u ? (
-                <option value="date_asc">Playlist order</option>
-              ) : (
-                <>
-                  <option value="date_desc">Newest first</option>
-                  <option value="date_asc">Oldest first</option>
-                </>
-              )}
-              <option value="name_asc">Name A–Z</option>
-              <option value="name_desc">Name Z–A</option>
-              {/* Every entry's size is 0, so a size sort would be arbitrary;
-                  group is the axis that actually means something here. */}
-              {isM3u && <option value="group_asc">Group A–Z</option>}
-              {isM3u && <option value="group_desc">Group Z–A</option>}
-              {!isM3u && <option value="size_desc">Largest first</option>}
-              {!isM3u && <option value="size_asc">Smallest first</option>}
-            </select>
+            {isM3u && (
+              <div className="flex items-center overflow-hidden rounded-lg border border-panda-border text-sm">
+                <Tooltip label="Cards grouped by category">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("grouped")}
+                    aria-pressed={viewMode === "grouped"}
+                    className={`flex items-center gap-1.5 px-3 py-2 ${
+                      viewMode === "grouped" ? "bg-panda-surface2 text-panda-accent" : "text-panda-muted hover:text-panda-text"
+                    }`}
+                  >
+                    <LayoutGrid size={14} /> Grouped
+                  </button>
+                </Tooltip>
+                <Tooltip label="Flat, sortable list">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("list")}
+                    aria-pressed={viewMode === "list"}
+                    className={`flex items-center gap-1.5 px-3 py-2 border-l border-panda-border ${
+                      viewMode === "list" ? "bg-panda-surface2 text-panda-accent" : "text-panda-muted hover:text-panda-text"
+                    }`}
+                  >
+                    <List size={14} /> List
+                  </button>
+                </Tooltip>
+              </div>
+            )}
+            {!grouped && (
+              <select
+                value={effectiveSort}
+                onChange={(e) => setSort(e.target.value)}
+                className="bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
+              >
+                {isM3u ? (
+                  <option value="date_asc">Playlist order</option>
+                ) : (
+                  <>
+                    <option value="date_desc">Newest first</option>
+                    <option value="date_asc">Oldest first</option>
+                  </>
+                )}
+                <option value="name_asc">Name A–Z</option>
+                <option value="name_desc">Name Z–A</option>
+                {/* Every entry's size is 0, so a size sort would be arbitrary;
+                    group is the axis that actually means something here. */}
+                {isM3u && <option value="group_asc">Group A–Z</option>}
+                {isM3u && <option value="group_desc">Group Z–A</option>}
+                {!isM3u && <option value="size_desc">Largest first</option>}
+                {!isM3u && <option value="size_asc">Smallest first</option>}
+              </select>
+            )}
+            {isM3u && healthJob && (
+              <span className="text-xs text-panda-muted self-center">
+                Checking streams… counts update live
+              </span>
+            )}
+            {isM3u && (
+              <select
+                value={health}
+                onChange={(e) => setHealth(e.target.value)}
+                title="Filter by whether the stream answered when it was last checked"
+                className="bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
+              >
+                <option value="">All channels</option>
+                <option value="available">Working{count(healthTotals.available)}</option>
+                <option value="unavailable">Not working{count(healthTotals.unavailable)}</option>
+                <option value="unknown">Didn't answer{count(healthTotals.unknown)}</option>
+                <option value="unchecked">Not checked{count(healthTotals.unchecked)}</option>
+              </select>
+            )}
             <Tooltip label={isM3u ? "Re-fetch this playlist now" : "Check Telegram now for new files"}>
               <button
                 type="button"
-                onClick={() => loadDocs(true)}
+                onClick={() => (grouped ? loadGroups(true) : loadDocs(true))}
                 disabled={refreshing}
                 className="flex items-center gap-1.5 rounded-lg border border-panda-border px-3 py-2 text-sm hover:border-panda-accent disabled:opacity-50"
               >
@@ -332,39 +438,58 @@ export default function CollectionView() {
 
           <KeywordPills collectionId={collectionId} onSelect={onKeywordSelect} />
 
-          {docs === null && (
-            <div className="flex items-center gap-2 text-panda-muted text-sm">
-              <Loader2 className="animate-spin" size={16} /> Loading {isM3u ? "channels" : "documents"}…
-            </div>
-          )}
-
-          {docs && docs.length === 0 && (
-            <EmptyState
-              title={isM3u ? "No channels found" : "No documents found"}
-              hint={`Nothing here yet, or your filter didn't match — every word has to appear in the ${
-                isM3u ? "channel name" : "filename"
-              }.`}
-            />
-          )}
-
-          {docs && docs.length > 0 && (
-            <div className="flex flex-col gap-2">
-              <p className="text-xs text-panda-muted">
-                Showing {docs.length} of {total ?? docs.length}
-              </p>
-              {docs.map((d) => (
-                <ItemRow
-                  key={`${d.sourceId}-${d.id}`}
-                  doc={d}
-                  sourceName={sources.length > 1 ? sources.find((c) => c.id === d.sourceId)?.name : undefined}
-                />
-              ))}
-              {total !== null && docs.length < total && (
-                <div ref={sentinelRef} className="flex items-center justify-center gap-2 text-panda-muted text-sm py-4">
-                  <Loader2 className="animate-spin" size={16} /> Loading more…
+          {grouped ? (
+            <>
+              {groups === null && (
+                <div className="flex items-center gap-2 text-panda-muted text-sm">
+                  <Loader2 className="animate-spin" size={16} /> Loading categories…
                 </div>
               )}
-            </div>
+              {groups && groups.length === 0 && (
+                <EmptyState
+                  title="No categories found"
+                  hint="Nothing here yet, or your filter didn't match any channel."
+                />
+              )}
+              {groups && groups.length > 0 && <GroupedChannels collectionId={collectionId} groups={groups} />}
+            </>
+          ) : (
+            <>
+              {docs === null && (
+                <div className="flex items-center gap-2 text-panda-muted text-sm">
+                  <Loader2 className="animate-spin" size={16} /> Loading {isM3u ? "channels" : "documents"}…
+                </div>
+              )}
+
+              {docs && docs.length === 0 && (
+                <EmptyState
+                  title={isM3u ? "No channels found" : "No documents found"}
+                  hint={`Nothing here yet, or your filter didn't match — every word has to appear in the ${
+                    isM3u ? "channel name" : "filename"
+                  }.`}
+                />
+              )}
+
+              {docs && docs.length > 0 && (
+                <div className="flex flex-col gap-2">
+                  <p className="text-xs text-panda-muted">
+                    Showing {docs.length} of {total ?? docs.length}
+                  </p>
+                  {docs.map((d) => (
+                    <ItemRow
+                      key={`${d.sourceId}-${d.id}`}
+                      doc={d}
+                      sourceName={sources.length > 1 ? sources.find((c) => c.id === d.sourceId)?.name : undefined}
+                    />
+                  ))}
+                  {total !== null && docs.length < total && (
+                    <div ref={sentinelRef} className="flex items-center justify-center gap-2 text-panda-muted text-sm py-4">
+                      <Loader2 className="animate-spin" size={16} /> Loading more…
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
           )}
         </>
       )}

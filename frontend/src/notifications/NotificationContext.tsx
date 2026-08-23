@@ -29,6 +29,10 @@ interface NotificationContextValue {
   // whenever one finishes — components use it as an effect dependency to
   // refetch the counts a completed scan just changed.
   jobsBySource: Record<string, RebuildJob>;
+  /** The running stream check, if there is one. Deliberately separate from
+   *  jobsBySource: that map is keyed by source id and drives "this playlist
+   *  is busy", which a check spanning every playlist is not. */
+  healthJob?: RebuildJob;
   jobsCompleted: number;
   markAllRead: () => void;
   dismissNotification: (id: string) => void;
@@ -61,6 +65,9 @@ function loadSeenJobs(): Set<string> {
 /** A channel's first pass is a "Scan"; a manual full pass over a channel
  *  that was already cached is a "Rescan". */
 function verb(job: RebuildJob): string {
+  // Probing stream URLs isn't a scan of a source at all — it spans every
+  // playlist at once — so it gets its own word.
+  if (job.kind === "health") return "Stream check";
   // A playlist is fetched whole rather than scanned message by message, and
   // the notification is the only place a user sees the work named.
   if (job.sourceType === "m3u") return job.kind === "rebuild" ? "Re-fetch" : "Fetch";
@@ -69,7 +76,8 @@ function verb(job: RebuildJob): string {
 
 function counted(job: RebuildJob): string {
   const n = job.scanned.toLocaleString();
-  if (job.sourceType === "m3u") return `${n} ${job.scanned === 1 ? "entry" : "entries"}`;
+  if (job.kind === "health") return `${n} stream${job.scanned === 1 ? "" : "s"} checked`;
+  if (job.sourceType === "m3u") return `${n} channel${job.scanned === 1 ? "" : "s"}`;
   return `${n} file${job.scanned === 1 ? "" : "s"}`;
 }
 
@@ -84,6 +92,7 @@ function persistSeenJobs(seen: Set<string>) {
 export function NotificationProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [jobsBySource, setJobsBySource] = useState<Record<string, RebuildJob>>({});
+  const [healthJob, setHealthJob] = useState<RebuildJob | undefined>(undefined);
   const [jobsCompleted, setJobsCompleted] = useState(0);
   const [notifications, setNotifications] = useState<Notification[]>(loadNotifications);
   // Tracks which rebuild jobs have already produced a notification, kept
@@ -183,7 +192,9 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
             pushToast(`${verb(job)} failed for "${job.sourceName}"`, "error");
           }
         }
-        setJobsBySource(Object.fromEntries([...runningJobs.current.values()].map((j) => [j.sourceId, j])));
+        const running = [...runningJobs.current.values()];
+        setJobsBySource(Object.fromEntries(running.map((j) => [j.sourceId, j])));
+        setHealthJob(running.find((j) => j.kind === "health"));
         if (finished) setJobsCompleted((n) => n + finished);
       } catch {
         // transient network hiccup — next tick retries
@@ -208,6 +219,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
         notifications,
         unreadCount,
         jobsBySource,
+        healthJob,
         jobsCompleted,
         markAllRead,
         dismissNotification,

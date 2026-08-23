@@ -2,6 +2,8 @@ import type {
   Channel,
   Collection,
   DocumentsResponse,
+  GroupsResponse,
+  HealthTotals,
   Integration,
   IntegrationStatus,
   KeywordCount,
@@ -9,6 +11,8 @@ import type {
   RebuildJob,
   SearchResponse,
   SourceType,
+  StreamHealthProfile,
+  StreamHealthStatus,
 } from "./types";
 
 class ApiError extends Error {
@@ -73,16 +77,45 @@ export const api = {
   },
   playlists: {
     list: () => request<Playlist[]>("/playlists"),
-    create: (body: { name: string; description: string; url: string; allowedExtensions: string[] }) =>
-      request<Playlist>("/playlists", { method: "POST", body: JSON.stringify(body) }),
+    create: (body: {
+      name: string;
+      description: string;
+      url: string;
+      allowedExtensions: string[];
+      refreshMinutes?: number | null;
+    }) => request<Playlist>("/playlists", { method: "POST", body: JSON.stringify(body) }),
     update: (
       id: string,
-      body: Partial<{ name: string; description: string; url: string; allowedExtensions: string[] }>
+      body: Partial<{
+        name: string;
+        description: string;
+        url: string;
+        allowedExtensions: string[];
+        refreshMinutes: number | null;
+      }>
     ) => request<Playlist>(`/playlists/${id}`, { method: "PUT", body: JSON.stringify(body) }),
     remove: (id: string, force = false) =>
       request<void>(`/playlists/${id}${force ? "?force=true" : ""}`, { method: "DELETE" }),
-    rescan: (id: string) =>
-      request<{ rebuilding: boolean; jobId: string }>(`/playlists/${id}/rescan`, { method: "POST" }),
+    /** `force` accepts a snapshot the server's shrink guard refused — only
+     *  ever from an explicit user decision, never automatically. */
+    rescan: (id: string, force = false) =>
+      request<{ rebuilding: boolean; jobId: string }>(
+        `/playlists/${id}/rescan${force ? "?force=true" : ""}`,
+        { method: "POST" }
+      ),
+    /** What stream checking knows, and what running one now would cost. */
+    streamHealth: () => request<StreamHealthStatus>("/playlists/health"),
+    /** The exact shape of the work a check would do, computed from the
+     *  cache — it makes no network requests of its own. */
+    streamHealthProfile: () => request<StreamHealthProfile>("/playlists/health/profile"),
+    /** Probe stream URLs now. Omit `id` for every playlist at once. Rejects
+     *  with 409 if a check is already running — only one at a time, so a
+     *  provider never sees two sweeps' worth of traffic. */
+    checkStreams: (id?: string) =>
+      request<{ checking: boolean; jobId: string }>(
+        id ? `/playlists/${id}/health/scan` : "/playlists/health/scan",
+        { method: "POST" }
+      ),
   },
   collections: {
     tree: (sourceType?: SourceType) =>
@@ -113,18 +146,45 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ parentId, orderedIds, sourceType }),
       }),
+    /** Reachability tallies alone — cheap enough to poll while a stream
+     *  check runs, unlike the documents endpoint. */
+    health: (id: string) => request<{ healthTotals: HealthTotals }>(`/collections/${id}/health`),
     documents: (
       id: string,
-      opts: { search?: string; sort?: string; refresh?: boolean; offset?: number; limit?: number } = {}
+      opts: {
+        search?: string;
+        sort?: string;
+        refresh?: boolean;
+        offset?: number;
+        limit?: number;
+        health?: string;
+        /** One category out of a (possibly `;`-joined) group_title. `""`
+         *  asks for the untagged bucket — distinct from omitting the field,
+         *  which applies no group filter at all. */
+        group?: string;
+      } = {}
     ) => {
       const params = new URLSearchParams();
       if (opts.search) params.set("search", opts.search);
       if (opts.sort) params.set("sort", opts.sort);
       if (opts.refresh) params.set("refresh", "true");
+      if (opts.health) params.set("health", opts.health);
       if (opts.offset) params.set("offset", String(opts.offset));
       if (opts.limit) params.set("limit", String(opts.limit));
+      if (opts.group !== undefined) params.set("group", opts.group);
       const qs = params.toString();
       return request<DocumentsResponse>(`/collections/${id}/documents${qs ? `?${qs}` : ""}`);
+    },
+    /** The Grouped view's overview — one category per card, with a real
+     *  count computed server-side rather than from whatever page of
+     *  documents happens to be loaded. */
+    groups: (id: string, opts: { search?: string; refresh?: boolean; health?: string } = {}) => {
+      const params = new URLSearchParams();
+      if (opts.search) params.set("search", opts.search);
+      if (opts.refresh) params.set("refresh", "true");
+      if (opts.health) params.set("health", opts.health);
+      const qs = params.toString();
+      return request<GroupsResponse>(`/collections/${id}/groups${qs ? `?${qs}` : ""}`);
     },
     keywords: (id: string, limit = 8) =>
       request<{ keywords: KeywordCount[] }>(`/collections/${id}/keywords?limit=${limit}`),

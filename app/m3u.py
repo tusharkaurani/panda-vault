@@ -39,7 +39,57 @@ TIMEOUT_SECONDS = int(os.environ.get("M3U_TIMEOUT_SECONDS", "30"))
 # them. Overridable for the ones that want something else.
 USER_AGENT = os.environ.get("M3U_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20")
 
+# A refresh replaces the whole snapshot, so a provider that answers with a
+# fraction of what it held yesterday silently destroys the rest. Below this
+# ratio the swap is refused and the previous snapshot kept, until the user
+# says otherwise. 0 disables the guard.
+SHRINK_GUARD_RATIO = float(os.environ.get("M3U_SHRINK_GUARD_RATIO", "0.5"))
+# Ratios are meaningless on tiny playlists — going from 4 entries to 1 is
+# not evidence of anything, so the guard only applies past this size.
+SHRINK_MIN_ENTRIES = int(os.environ.get("M3U_SHRINK_MIN_ENTRIES", "50"))
+
 _PROGRESS_EVERY = 500  # entries between progress callbacks while parsing
+
+# How far into the body to look for the #EXTM3U marker. Some providers emit
+# a UTF-8 BOM, a blank line or a comment banner ahead of it.
+_MARKER_WINDOW = 1024
+
+
+class PlaylistError(RuntimeError):
+    """Base for every reason a playlist could not be brought up to date.
+
+    Deliberately a RuntimeError: the routers and documents.py already treat
+    RuntimeError as "this source could not be reached, say so and carry on",
+    and these are all that same category with a machine-readable reason
+    attached.
+    """
+
+    #: The cache.FETCH_* status this maps to.
+    status = cache.FETCH_FAILED
+
+
+class PlaylistUnavailable(PlaylistError):
+    """The URL did not answer, or answered with an HTTP error."""
+
+    status = cache.FETCH_FAILED
+
+
+class PlaylistInvalid(PlaylistError):
+    """It answered, but with something that is not a playlist."""
+
+    status = cache.FETCH_INVALID
+
+
+class PlaylistShrank(PlaylistError):
+    """It answered with far fewer entries than last time, so the snapshot
+    swap was refused rather than destroying the previous one."""
+
+    status = cache.FETCH_SHRUNK
+
+    def __init__(self, message: str, incoming: int, previous: int):
+        super().__init__(message)
+        self.incoming = incoming
+        self.previous = previous
 
 # Attribute pairs inside an #EXTINF line: tvg-name="…" group-title="…" etc.
 _ATTR = re.compile(r'([\w-]+)\s*=\s*"([^"]*)"')
@@ -168,7 +218,9 @@ def fetch(url: str) -> str:
     if scheme not in ("http", "https"):
         # Without this, a file:// or ftp:// URL would let anyone who can add
         # a playlist read files off the server through the entry list.
-        raise RuntimeError(f"Only http and https playlist URLs are supported (got {scheme or 'none'!r})")
+        raise PlaylistInvalid(
+            f"Only http and https playlist URLs are supported (got {scheme or 'none'!r})"
+        )
 
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
     try:
@@ -177,15 +229,60 @@ def fetch(url: str) -> str:
             # than silently truncated into a half-parsed playlist.
             raw = response.read(MAX_BYTES + 1)
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Playlist fetch failed — HTTP {e.code} {e.reason}") from e
+        raise PlaylistUnavailable(f"Playlist fetch failed — HTTP {e.code} {e.reason}") from e
     except (urllib.error.URLError, OSError) as e:
-        raise RuntimeError(f"Could not reach the playlist URL: {getattr(e, 'reason', e)}") from e
+        raise PlaylistUnavailable(f"Could not reach the playlist URL: {getattr(e, 'reason', e)}") from e
 
     if len(raw) > MAX_BYTES:
-        raise RuntimeError(f"Playlist is larger than {MAX_BYTES // (1024 * 1024)}MB — refusing to load it")
+        raise PlaylistInvalid(f"Playlist is larger than {MAX_BYTES // (1024 * 1024)}MB — refusing to load it")
     # Providers are inconsistent about encoding and a stray byte shouldn't
     # cost the whole playlist, so replace rather than raise.
     return raw.decode("utf-8", errors="replace")
+
+
+def _is_bare_url(line: str) -> bool:
+    """Whether a line is nothing but a stream URL.
+
+    The whole-line test matters: an HTML error page is full of text
+    *containing* URLs, and `"http" in line` would happily accept one as
+    proof that a login page is a playlist.
+    """
+    return (
+        line.lower().startswith(("http://", "https://"))
+        and not any(c.isspace() for c in line)
+        and "<" not in line
+    )
+
+
+def _validate_body(text: str) -> None:
+    """Reject anything that answered 200 but isn't a playlist.
+
+    Worth its own step because parse() is deliberately forgiving — it takes
+    *any* non-directive line as a stream URL, so an expired-subscription
+    page or a captive-portal login form doesn't fail, it silently becomes a
+    few dozen channels whose URLs are fragments of HTML. That then replaces
+    the real snapshot, and the playlist looks merely wrong rather than
+    broken.
+    """
+    head = text[:_MARKER_WINDOW].lstrip("\ufeff \t\r\n")
+    if "#EXTM3U" in head.upper():
+        return
+
+    # No header. A plain list of URLs is still a valid playlist, so look for
+    # one before giving up — but only lines that are entirely a URL.
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and _is_bare_url(line):
+            return
+
+    if head.lstrip().startswith("<"):
+        raise PlaylistInvalid(
+            "The URL returned a web page, not a playlist — the provider may want a "
+            "login, or the link may have expired"
+        )
+    if not text.strip():
+        raise PlaylistInvalid("The URL returned an empty response")
+    raise PlaylistInvalid("The URL did not return a playlist — no #EXTM3U header and no stream URLs")
 
 
 # --------------------------------------------------------------------------
@@ -225,9 +322,34 @@ def _to_documents(entries: Iterator[Entry], on_progress: Optional[Callable]) -> 
     return docs
 
 
-def _sync_blocking(playlist_id: str, url: str, on_progress: Optional[Callable]) -> int:
+def _shrank(incoming: int, previous: int) -> bool:
+    """Whether this snapshot is small enough, relative to the last one, to be
+    worth refusing. Providers routinely trim a handful of dead channels; the
+    case this catches is a free tier collapsing from thousands to a token
+    few, which the swap would otherwise make permanent."""
+    if SHRINK_GUARD_RATIO <= 0 or previous < SHRINK_MIN_ENTRIES:
+        return False
+    return incoming < previous * SHRINK_GUARD_RATIO
+
+
+def _sync_blocking(
+    playlist_id: str, url: str, on_progress: Optional[Callable], allow_shrink: bool
+) -> int:
     text = fetch(url)
+    _validate_body(text)
     docs = _to_documents(parse(text), on_progress)
+
+    # Unfiltered, matching what replace_source_documents is about to remove:
+    # comparing against an allowlist-filtered count would read a widened
+    # allowlist as a collapse.
+    previous = cache.count_documents(playlist_id) if cache.has_source(playlist_id) else 0
+    if not allow_shrink and _shrank(len(docs), previous):
+        raise PlaylistShrank(
+            f"Playlist came back with {len(docs):,} entries, down from {previous:,} — "
+            f"kept the previous copy. Rescan with \"replace anyway\" if this is expected.",
+            len(docs),
+            previous,
+        )
     return cache.replace_source_documents(playlist_id, docs)
 
 
@@ -236,6 +358,7 @@ async def sync_playlist(
     url: str,
     force_refresh: bool = False,
     on_progress: Optional[Callable] = None,
+    allow_shrink: bool = False,
 ) -> int:
     """Bring a playlist's cached entries up to date, returning how many it
     holds afterwards.
@@ -246,6 +369,14 @@ async def sync_playlist(
 
     There is no full_rebuild counterpart: every sync is already a full
     rebuild, because a playlist has no incremental mode to rebuild *from*.
+
+    `allow_shrink` overrides the guard that refuses a snapshot far smaller
+    than the last one — the user having looked at the numbers and decided
+    the collapse is real.
+
+    Every attempt that actually reaches the network is recorded against the
+    source's health, here rather than in the callers, so the scheduled
+    refresh, a manual rescan and a collection open all leave the same trail.
     """
     if not force_refresh and cache.has_source(playlist_id):
         return cache.count_documents(playlist_id)
@@ -258,6 +389,22 @@ async def sync_playlist(
         # Fetch, parse and the bulk insert are all blocking, and a large
         # playlist is hundreds of thousands of lines — this would stall the
         # event loop for everyone else.
-        count = await asyncio.to_thread(_sync_blocking, playlist_id, url, on_progress)
+        try:
+            count = await asyncio.to_thread(
+                _sync_blocking, playlist_id, url, on_progress, allow_shrink
+            )
+        except PlaylistError as e:
+            streak = await asyncio.to_thread(cache.record_fetch, playlist_id, e.status, str(e))
+            log.warning("Playlist %s fetch %s (failure %d): %s", playlist_id, e.status, streak, e)
+            raise
+        except asyncio.CancelledError:
+            # A shutdown mid-fetch says nothing about the URL, so it must not
+            # count against the streak or the playlist would look broken
+            # after a few restarts.
+            raise
+        except Exception as e:
+            await asyncio.to_thread(cache.record_fetch, playlist_id, cache.FETCH_FAILED, str(e))
+            raise
+        await asyncio.to_thread(cache.record_fetch, playlist_id, cache.FETCH_OK)
         log.info("Playlist %s synced: %d entr%s", playlist_id, count, "y" if count == 1 else "ies")
         return count

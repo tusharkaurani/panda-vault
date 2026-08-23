@@ -29,3 +29,17 @@ export function collectionsBySource(nodes: Collection[]): Record<string, Collect
   walk(nodes, []);
   return bySource;
 }
+
+/** The chain of collections from the tree's root down to `id`, or null if
+ *  it isn't in the tree — used to build a breadcrumb trail. */
+export function findPath(nodes: Collection[], id: string, trail: Collection[] = []): Collection[] | null {
+  for (const n of nodes) {
+    const next = [...trail, n];
+    if (n.id === id) return next;
+    if (n.children.length) {
+      const found = findPath(n.children, id, next);
+      if (found) return found;
+    }
+  }
+  return null;
+}

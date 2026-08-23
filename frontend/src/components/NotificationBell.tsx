@@ -1,17 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertCircle, Bell, CheckCircle2, X } from "lucide-react";
 import { useNotifications } from "../notifications/NotificationContext";
+import { timeAgo } from "../lib/time";
 import Tooltip from "./Tooltip";
-
-function timeAgo(ts: number): string {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return "just now";
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  return `${Math.floor(h / 24)}d ago`;
-}
 
 export default function NotificationBell() {
   const { notifications, unreadCount, markAllRead, dismissNotification, clearAllNotifications } = useNotifications();

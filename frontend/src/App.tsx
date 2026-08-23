@@ -2,6 +2,7 @@ import { Route, Routes } from "react-router-dom";
 import Layout from "./components/Layout";
 import Landing from "./pages/Landing";
 import CollectionView from "./pages/CollectionView";
+import GroupChannelsView from "./pages/GroupChannelsView";
 import Search from "./pages/Search";
 import SourceHome from "./pages/SourceHome";
 import Settings from "./pages/Settings";
@@ -23,6 +24,7 @@ export default function App() {
             <Route path="/" element={<Landing />} />
             <Route path="/s/:sourceType" element={<SourceHome />} />
             <Route path="/c/:collectionId" element={<CollectionView />} />
+            <Route path="/c/:collectionId/group/:group" element={<GroupChannelsView />} />
             <Route path="/search" element={<Search />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="*" element={<Landing />} />

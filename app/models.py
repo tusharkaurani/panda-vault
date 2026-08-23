@@ -77,6 +77,10 @@ class Playlist(BaseModel):
     description: str = ""
     url: str  # remote .m3u / .m3u8, exactly as entered
     allowedExtensions: List[str] = Field(default_factory=list)  # matched against the stream URL's extension
+    # How often to re-fetch. None means the M3U_REFRESH_MINUTES default,
+    # rather than a copy of it, so raising the default lifts every playlist
+    # that never had an opinion.
+    refreshMinutes: Optional[int] = None
     created_at: float = Field(default_factory=time.time)
 
 
@@ -85,7 +89,26 @@ class PlaylistOut(Playlist):
 
     fileCount: int = 0
     # unscanned | scanning | rebuilding | ready | empty | error
+    #   | stale | invalid | needs_review
+    # The last three are playlist-only: a URL that has stopped answering,
+    # one answering with something that isn't a playlist, and one whose
+    # latest snapshot was refused for being far smaller than the last.
     status: str = "unscanned"
+
+    # How the last fetch that reached the network went. None means one has
+    # never been attempted, which is not the same as one having failed.
+    fetchStatus: Optional[str] = None  # ok | failed | invalid | shrunk
+    fetchError: Optional[str] = None
+    lastOkAt: Optional[float] = None
+    # Consecutive failures. 1 is a blip and stays quiet; the UI leads with
+    # the problem once it climbs.
+    failStreak: int = 0
+
+
+# Floor and ceiling for a playlist's own refresh interval: often enough to
+# be useful, never often enough to look like an attack on the provider.
+MIN_REFRESH_MINUTES = 15
+MAX_REFRESH_MINUTES = 60 * 24 * 7
 
 
 class PlaylistIn(BaseModel):
@@ -93,6 +116,9 @@ class PlaylistIn(BaseModel):
     description: str = ""
     url: str
     allowedExtensions: List[str] = Field(default_factory=list)
+    refreshMinutes: Optional[int] = Field(
+        default=None, ge=MIN_REFRESH_MINUTES, le=MAX_REFRESH_MINUTES
+    )
 
 
 class PlaylistUpdate(BaseModel):
@@ -100,6 +126,9 @@ class PlaylistUpdate(BaseModel):
     description: Optional[str] = None
     url: Optional[str] = None
     allowedExtensions: Optional[List[str]] = None
+    refreshMinutes: Optional[int] = Field(
+        default=None, ge=MIN_REFRESH_MINUTES, le=MAX_REFRESH_MINUTES
+    )
 
 
 class Collection(BaseModel):
@@ -187,6 +216,13 @@ class DocumentOut(BaseModel):
     url: Optional[str] = None
     logo: Optional[str] = None
     group: Optional[str] = None
+    # m3u only, and None for anything without a URL to probe. Joined in at
+    # query time from stream_health, which is keyed by URL rather than by
+    # entry — a playlist refresh renumbers every entry, so a per-row status
+    # would not survive the night. "unchecked" means no probe has happened
+    # yet, which reads differently from one that came back unreachable.
+    health: Optional[str] = None  # available | unavailable | unknown | unchecked
+    healthCheckedAt: Optional[float] = None
 
     @computed_field
     @property

@@ -3,6 +3,7 @@ import { ExternalLink } from "lucide-react";
 import type { DocumentOut } from "../types";
 import { initialsFor, logoSrc } from "../lib/logos";
 import CopyLinkButton from "./CopyLinkButton";
+import StreamHealthDot from "./StreamHealthDot";
 import Tooltip from "./Tooltip";
 
 /** The extension the stream URL ends in — the same thing a playlist's
@@ -30,7 +31,12 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
       // noreferrer as well as noopener: providers key off the Referer header
       // and some reject a request that arrives with an unexpected one.
       rel="noopener noreferrer"
-      className="doc-row group flex items-center gap-3 rounded-lg border border-panda-border bg-panda-surface px-4 py-3 hover:border-panda-accent transition-colors"
+      className={`doc-row group flex items-center gap-3 rounded-lg border border-panda-border bg-panda-surface px-4 py-3 hover:border-panda-accent transition-colors ${
+        // Dimmed, never disabled: a probe can be wrong (geo-blocks, a
+        // provider that only answers real players) and the link is still
+        // worth a try.
+        doc.health === "unavailable" ? "opacity-60" : ""
+      }`}
     >
       <div className="shrink-0 h-10 w-10 rounded-md bg-panda-surface2 border border-panda-border overflow-hidden flex items-center justify-center">
         {logo ? (
@@ -52,7 +58,10 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
       </div>
 
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium">{doc.name}</p>
+        <p className="flex items-center gap-1.5 text-sm font-medium">
+          <StreamHealthDot health={doc.health} checkedAt={doc.healthCheckedAt} />
+          <span className="truncate">{doc.name}</span>
+        </p>
         <p className="flex items-center gap-1.5 flex-wrap text-xs text-panda-muted">
           {doc.group && (
             <span className="rounded-full bg-panda-surface2 border border-panda-border px-1.5 py-0.5">

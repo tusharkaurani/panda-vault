@@ -95,6 +95,70 @@ async def _sync_bound(bound, source_type, refresh: bool) -> List[str]:
     return errors
 
 
+@router.get("/{collection_id}/health")
+async def get_collection_health(collection_id: str):
+    """Just this collection's reachability tallies.
+
+    Split out from the documents endpoint so a page can follow a running
+    stream check without re-requesting the documents themselves — which
+    would replace an infinite-scrolled list with its first page and throw
+    away the reader's position every few seconds.
+    """
+    node = _find(store.load_collections(), collection_id)
+    if not node:
+        raise HTTPException(404, "Collection not found")
+    if node.sourceType != M3U or not node.sourceIds:
+        return {"healthTotals": {}}
+    scope = sources.scope(sources.bound(node, sources.load_by_id(node.sourceType)))
+    return {"healthTotals": await asyncio.to_thread(cache.stream_health_summary, scope)}
+
+
+@router.get("/{collection_id}/groups")
+async def get_collection_groups(
+    collection_id: str,
+    search: Optional[str] = None,
+    refresh: bool = False,
+    health: Optional[str] = None,
+):
+    """The Grouped view's overview: one card per category with a real count,
+    honoring the same search/health filters `/documents` would. Split out
+    rather than folded into `/documents` because a category listing is a
+    different query shape (GROUP BY, not LIMIT/OFFSET) that would otherwise
+    run on every documents call regardless of which view mode asked for it.
+    """
+    collections = store.load_collections()
+    node = _find(collections, collection_id)
+    if not node:
+        raise HTTPException(404, "Collection not found")
+    if not node.sourceIds:
+        raise HTTPException(400, "Collection is a container, not bound to any source")
+
+    bound = sources.bound(node, sources.load_by_id(node.sourceType))
+    if not bound:
+        raise HTTPException(409, "None of this collection's sources exist anymore — rebind it in Settings")
+
+    errors: List[str] = await _sync_bound(bound, node.sourceType, refresh)
+    scope = sources.scope(bound)
+    rows = await asyncio.to_thread(cache.list_groups, scope, search, health)
+    counts = cache.source_counts(scope)
+    health_totals = (
+        await asyncio.to_thread(cache.stream_health_summary, scope)
+        if node.sourceType == M3U
+        else {}
+    )
+
+    if not rows and errors:
+        raise HTTPException(502, "; ".join(errors))
+
+    return {
+        "collection": node,
+        "sources": [jobs.to_source_out(s, node.sourceType, counts.get(s.id)) for s in bound],
+        "groups": [{"name": name, "count": entry_count} for name, entry_count in rows],
+        "errors": errors,
+        "healthTotals": health_totals,
+    }
+
+
 @router.get("/{collection_id}/documents")
 async def get_documents(
     collection_id: str,
@@ -103,6 +167,8 @@ async def get_documents(
     refresh: bool = False,
     offset: int = 0,
     limit: int = 20,
+    health: Optional[str] = None,
+    group: Optional[str] = None,
 ):
     collections = store.load_collections()
     node = _find(collections, collection_id)
@@ -122,9 +188,16 @@ async def get_documents(
     # Extension allowlist, substring search, ordering and paging all happen
     # in SQL — the router never holds more than one page of documents.
     page, total = await asyncio.to_thread(
-        cache.query_documents, scope, search, sort, offset, limit
+        cache.query_documents, scope, search, sort, offset, limit, health, group
     )
     counts = cache.source_counts(scope)
+    # What the health filter's options should be labelled with. Only streams
+    # have a reachability state, so a Telegram collection doesn't pay for it.
+    health_totals = (
+        await asyncio.to_thread(cache.stream_health_summary, scope)
+        if node.sourceType == M3U
+        else {}
+    )
 
     if not total and errors:
         raise HTTPException(502, "; ".join(errors))
@@ -137,4 +210,5 @@ async def get_documents(
         "offset": offset,
         "limit": limit,
         "errors": errors,
+        "healthTotals": health_totals,
     }

@@ -4,7 +4,7 @@ import type { RebuildJob } from "../types";
  *  count of matching files, which only arrives with the first batch — until
  *  then there's no denominator, so the bar runs indeterminate rather than
  *  inventing one. */
-export default function ScanProgress({ job }: { job: RebuildJob }) {
+export default function ScanProgress({ job, unit = "files" }: { job: RebuildJob; unit?: string }) {
   const pct = job.total ? Math.min(100, Math.round((job.scanned / job.total) * 100)) : null;
 
   return (
@@ -18,7 +18,7 @@ export default function ScanProgress({ job }: { job: RebuildJob }) {
       </div>
       <span className="shrink-0 text-[11px] tabular-nums text-panda-muted">
         {job.scanned.toLocaleString()}
-        {job.total ? ` / ${job.total.toLocaleString()}` : ""} files
+        {job.total ? ` / ${job.total.toLocaleString()}` : ""} {unit}
         {pct !== null && ` · ${pct}%`}
       </span>
     </div>

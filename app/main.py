@@ -31,7 +31,7 @@ logging.basicConfig(
 # would bury this app's own scan/rebuild lines in the container logs.
 logging.getLogger("telethon").setLevel(logging.WARNING)
 
-from . import cache, refresh, telegram_client  # noqa: E402  (needs env vars loaded first)
+from . import cache, health, refresh, telegram_client  # noqa: E402  (needs env vars loaded first)
 from .routers import (  # noqa: E402
     auth,
     channels,
@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI):
     refresh.start()
     yield
     refresh.stop()
+    # The probe pool's threads are parked on sockets with a few seconds left
+    # on their timeouts; don't wait for them to notice.
+    health.shutdown()
     await telegram_client.stop()
     cache.close()
 
@@ -95,7 +98,11 @@ async def require_telegram_auth(request, call_next):
 
 
 @app.get("/api/health")
-async def health():
+async def health_check():
+    # Not `health`: that name is the health module imported above, and a
+    # route function would shadow it — which it silently did, turning
+    # health.shutdown() in the lifespan into an AttributeError that took
+    # telegram_client.stop() and cache.close() down with it.
     return {"status": "ok"}
 
 

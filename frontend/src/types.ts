@@ -12,8 +12,14 @@ export type ChannelStatus =
   | "error"
   | "not_joined";
 
+/** States only a fetched-by-URL source can be in. `stale` and `invalid`
+ *  both mean the cached entries are still browsable but no longer being
+ *  updated; `needs_review` means the newest snapshot was refused for being
+ *  drastically smaller than the one it would have replaced. */
+export type PlaylistStatus = "stale" | "invalid" | "needs_review";
+
 /** A playlist is never `not_joined` — there is nothing to join. */
-export type SourceStatus = ChannelStatus;
+export type SourceStatus = ChannelStatus | PlaylistStatus;
 
 export interface Channel {
   id: string;
@@ -36,9 +42,18 @@ export interface Playlist {
   url: string;
   /** Matched against the *stream* URL's extension, not the entry's name. */
   allowedExtensions: string[];
+  /** How often to re-fetch, in minutes. null = the server's default. */
+  refreshMinutes: number | null;
   created_at: number;
   fileCount: number;
   status: SourceStatus;
+  /** How the last fetch that reached the network went. null = never tried. */
+  fetchStatus: "ok" | "failed" | "invalid" | "shrunk" | null;
+  fetchError: string | null;
+  /** Unix seconds of the last fetch that actually worked. */
+  lastOkAt: number | null;
+  /** Consecutive failures — 1 is treated as a blip. */
+  failStreak: number;
 }
 
 /** Whichever kind of thing a collection is bound to. */
@@ -76,11 +91,25 @@ export interface DocumentOut {
   mime_type?: string | null;
   sourceId?: string | null;
   sourceType: SourceType;
+  /** m3u only, null for anything with no URL to probe. Joined in from the
+   *  URL-keyed health table, so it survives the nightly snapshot swap that
+   *  renumbers every entry. */
+  health: StreamHealth | null;
+  healthCheckedAt: number | null;
   // m3u only, null for Telegram documents.
   url?: string | null;
   logo?: string | null;
   group?: string | null;
 }
+
+/** Whether a stream URL answered when it was last probed. `unchecked` means
+ *  no probe has happened yet, which reads differently from one that came
+ *  back unreachable. Telegram documents have no URL and so carry null. */
+export type StreamHealth = "available" | "unavailable" | "unknown" | "unchecked";
+
+/** Entry counts per reachability state — entries, not distinct URLs, since a
+ *  stream listed in three playlists is three things you can click. */
+export type HealthTotals = Partial<Record<StreamHealth, number>>;
 
 export interface DocumentsResponse {
   collection: Collection;
@@ -90,6 +119,55 @@ export interface DocumentsResponse {
   offset: number;
   limit: number;
   errors?: string[];
+  /** Empty for Telegram collections — only streams have a health state. */
+  healthTotals?: HealthTotals;
+}
+
+/** One category card in the Grouped view's overview. `name` is `""` for the
+ *  "Other channels" bucket — untagged entries, not "no filter". */
+export interface GroupSummary {
+  name: string;
+  count: number;
+}
+
+export interface GroupsResponse {
+  collection: Collection;
+  sources: Source[];
+  groups: GroupSummary[];
+  errors?: string[];
+  healthTotals?: HealthTotals;
+}
+
+/** GET /api/playlists/health/profile — exactly what a check would do,
+ *  worked out from the cache without making a single request. The range on
+ *  `requests` is real uncertainty: the floor assumes every triaged provider
+ *  is down (so none of its URLs need probing individually), the ceiling that
+ *  they are all up. Which it is, is the thing the check exists to find out. */
+export interface StreamHealthProfile {
+  /** Total stream entries across every playlist. */
+  entries: number;
+  /** Distinct URLs actually due a probe. */
+  dueUrls: number;
+  /** Entries skipped because another playlist lists the same URL. */
+  deduped: number;
+  hosts: number;
+  /** Hosts big enough that one connect can settle them wholesale. */
+  triageHosts: number;
+  triageUrls: number;
+  singleUrlHosts: number;
+  requests: { min: number; max: number };
+  minutes: { min: number; max: number };
+  approxMegabytes: number;
+}
+
+/** GET /api/playlists/health — the state of stream checking vault-wide. */
+export interface StreamHealthStatus {
+  running: boolean;
+  lastSweepAt: number | null;
+  /** Distinct URLs a check would probe right now. */
+  due: number;
+  estimatedMinutes: number;
+  totals: HealthTotals;
 }
 
 // Deliberately flat: this used to carry the whole `Collection` (recursively,
@@ -122,7 +200,7 @@ export interface RebuildJob {
   sourceId: string;
   sourceName: string;
   sourceType: SourceType;
-  kind: "scan" | "rebuild";
+  kind: "scan" | "rebuild" | "health";
   status: "running" | "done" | "error";
   scanned: number;
   total: number | null;

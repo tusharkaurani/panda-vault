@@ -36,10 +36,11 @@ export interface DragHandlers {
 function countParts(collection: Collection): string[] {
   const fileCount = collection.fileCount ?? 0;
   // An M3U collection holds live streams, not files — counting them in
-  // "files" reads as though something is downloadable when nothing is.
+  // "files" reads as though something is downloadable when nothing is. Each
+  // playlist entry is a TV channel, so that's what the count calls them.
   const unit =
     collection.sourceType === "m3u"
-      ? fileCount === 1 ? "entry" : "entries"
+      ? fileCount === 1 ? "channel" : "channels"
       : fileCount === 1 ? "file" : "files";
   const fileLabel = `${fileCount.toLocaleString()} ${unit}`;
   if (collection.sourceIds.length > 0) return [fileLabel];
