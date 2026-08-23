@@ -4,6 +4,7 @@ import { Home, Settings as SettingsIcon } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Collection, SourceType } from "../types";
 import BackToTop from "../components/BackToTop";
+import Breadcrumbs from "../components/Breadcrumbs";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
 import IntegrationIcon from "../components/IntegrationIcon";
@@ -32,11 +33,7 @@ export default function Landing() {
 
   return (
     <div className="flex flex-col gap-6">
-      <nav className="flex items-center gap-1 text-sm text-panda-muted flex-wrap">
-        <span className="flex items-center gap-1 text-panda-text font-medium">
-          <Home size={14} /> Library
-        </span>
-      </nav>
+      <Breadcrumbs items={[{ label: "Library", icon: <Home size={14} /> }]} />
 
       <div>
         <h1 className="text-2xl font-semibold">Library</h1>

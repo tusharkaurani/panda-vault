@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
-import { ChevronRight, Home, Loader2 } from "lucide-react";
+import { useSearchParams } from "react-router-dom";
+import { Home, Loader2 } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { SearchResult } from "../types";
 import { MIN_SEARCH_LENGTH, SEARCH_PAGE_SIZE } from "../lib/search";
+import Breadcrumbs from "../components/Breadcrumbs";
 import ItemRow from "../components/ItemRow";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
@@ -83,15 +84,9 @@ export default function Search() {
 
   return (
     <div className="flex flex-col gap-6">
-      <nav className="flex items-center gap-1 text-sm text-panda-muted flex-wrap">
-        <Link to="/" className="flex items-center gap-1 hover:text-panda-accent">
-          <Home size={14} /> Library
-        </Link>
-        <span className="flex items-center gap-1">
-          <ChevronRight size={14} />
-          <span className="text-panda-text font-medium">Search</span>
-        </span>
-      </nav>
+      <Breadcrumbs
+        items={[{ label: "Library", to: "/", icon: <Home size={14} /> }, { label: "Search" }]}
+      />
 
       <div>
         <h1 className="text-2xl font-semibold">Search results</h1>

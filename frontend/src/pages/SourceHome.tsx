@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
-import { ChevronRight, Home } from "lucide-react";
+import { useParams } from "react-router-dom";
+import { Home } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Collection, SourceType } from "../types";
+import Breadcrumbs from "../components/Breadcrumbs";
 import BackToTop from "../components/BackToTop";
 import CollectionGrid from "../components/CollectionGrid";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
+import { useIntegrations } from "../integrations/IntegrationsContext";
 
-const LABELS: Record<SourceType, string> = { telegram: "Telegram", m3u: "M3U" };
+// The *source* noun, not a display label: this one is fixed by the source
+// type, where the heading above it is whatever the user named the root.
 const NOUN: Record<SourceType, string> = { telegram: "channel", m3u: "playlist" };
 
 function isSourceType(value: string): value is SourceType {
@@ -21,6 +24,7 @@ function isSourceType(value: string): value is SourceType {
  *  two of them could not be persisted. */
 export default function SourceHome() {
   const { sourceType = "" } = useParams();
+  const { byId } = useIntegrations();
   const [collections, setCollections] = useState<Collection[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,20 +40,20 @@ export default function SourceHome() {
     return <ErrorBanner message={`Unknown integration "${sourceType}".`} />;
   }
 
+  // Falls back to the id in the instant before the catalog arrives.
+  const label = byId(sourceType)?.name ?? sourceType;
+
   return (
     <div className="flex flex-col gap-6">
-      <nav className="flex items-center gap-1 text-sm text-panda-muted flex-wrap">
-        <Link to="/" className="flex items-center gap-1 hover:text-panda-accent">
-          <Home size={14} /> Library
-        </Link>
-        <span className="flex items-center gap-1">
-          <ChevronRight size={14} />
-          <span className="text-panda-text font-medium">{LABELS[sourceType]}</span>
-        </span>
-      </nav>
+      <Breadcrumbs
+        items={[
+          { label: "Library", to: "/", icon: <Home size={14} /> },
+          { label },
+        ]}
+      />
 
       <div>
-        <h1 className="text-2xl font-semibold">{LABELS[sourceType]}</h1>
+        <h1 className="text-2xl font-semibold">{label}</h1>
       </div>
 
       {error && <ErrorBanner message={error} />}
@@ -57,7 +61,7 @@ export default function SourceHome() {
       {collections && collections.length === 0 && (
         <EmptyState
           title="No collections yet"
-          hint={`Create a ${LABELS[sourceType]} collection in Settings and bind it to a ${NOUN[sourceType]}.`}
+          hint={`Create a ${label} collection in Settings and bind it to a ${NOUN[sourceType]}.`}
         />
       )}
 

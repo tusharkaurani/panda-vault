@@ -196,6 +196,39 @@ class CollectionTreeNode(Collection):
     folderCount: int = 0
 
 
+class SourceExport(BaseModel):
+    """One exported channel or playlist. `id` is a reference local to this
+    export file, only used to reattach `CollectionExport.sourceIds` — it has
+    no relation to any id in the vault that imports it, which mints its own."""
+
+    id: str
+    name: str
+    description: str = ""
+    channel: Optional[str] = None  # telegram only
+    url: Optional[str] = None  # m3u only
+    allowedExtensions: List[str] = Field(default_factory=list)
+    refreshMinutes: Optional[int] = None  # m3u only
+
+
+class CollectionExport(BaseModel):
+    name: str
+    description: str = ""
+    icon: Optional[str] = None
+    sourceIds: List[str] = Field(default_factory=list)
+    children: List["CollectionExport"] = Field(default_factory=list)
+
+
+class IntegrationExport(BaseModel):
+    """The portable shape of GET/POST .../export|import — deliberately just
+    what's visible in Settings, never the document cache: the destination
+    vault scans for itself."""
+
+    sourceType: SourceType
+    integrationName: Optional[str] = None
+    sources: List[SourceExport] = Field(default_factory=list)
+    collections: List[CollectionExport] = Field(default_factory=list)
+
+
 class DocumentOut(BaseModel):
     """One item in a collection — a Telegram document, or an M3U stream
     entry. The m3u-only fields are None for documents and vice versa."""
@@ -231,6 +264,17 @@ class DocumentOut(BaseModel):
         cache for a string that's a pure function of `size`. Still emitted
         in every response, so the API contract is unchanged."""
         return human_size(self.size)
+
+
+class IntegrationIn(BaseModel):
+    """Body for adding an integration. `name` labels its root node in the
+    Library; omitted means "use the catalog default"."""
+
+    name: Optional[str] = None
+
+
+class IntegrationUpdate(BaseModel):
+    name: Optional[str] = None
 
 
 class PhoneIn(BaseModel):

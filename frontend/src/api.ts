@@ -5,6 +5,7 @@ import type {
   GroupsResponse,
   HealthTotals,
   Integration,
+  IntegrationExport,
   IntegrationStatus,
   KeywordCount,
   Playlist,
@@ -72,8 +73,21 @@ export const api = {
   },
   integrations: {
     list: () => request<{ integrations: Integration[] }>("/integrations"),
-    add: (id: SourceType) => request<Integration>(`/integrations/${id}`, { method: "POST" }),
+    // `name` labels the integration's root node in the Library; omitted (or
+    // blank) means the catalog default.
+    add: (id: SourceType, name?: string) =>
+      request<Integration>(`/integrations/${id}`, { method: "POST", body: JSON.stringify({ name: name ?? null }) }),
+    rename: (id: SourceType, name: string) =>
+      request<Integration>(`/integrations/${id}`, { method: "PATCH", body: JSON.stringify({ name }) }),
     remove: (id: SourceType) => request<void>(`/integrations/${id}`, { method: "DELETE" }),
+    // The sources and collection tree Settings shows for this integration —
+    // never the document cache, which the destination vault scans for itself.
+    export: (id: SourceType) => request<IntegrationExport>(`/integrations/${id}/export`),
+    import: (id: SourceType, data: IntegrationExport) =>
+      request<{ sourcesAdded: number; collectionsAdded: number }>(`/integrations/${id}/import`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
   },
   playlists: {
     list: () => request<Playlist[]>("/playlists"),

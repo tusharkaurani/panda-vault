@@ -213,7 +213,13 @@ export interface RebuildJob {
  *  what this vault has actually added. */
 export interface Integration {
   id: SourceType;
+  /** What this integration's root node is called in the Library — the user's
+   *  label once they've set one, `defaultName` until then. */
   name: string;
+  /** The catalog's own name for the type, e.g. "M3U Playlists". Survives a
+   *  rename, so the UI can offer it as a placeholder and still say what kind
+   *  of thing this is. */
+  defaultName: string;
   description: string;
   /** Whether it needs credentials before it can be signed into at all. */
   needsCredentials: boolean;
@@ -227,6 +233,37 @@ export interface Integration {
   sourceCount: number;
   /** Added but not yet usable — the UI leads with this. */
   needsSetup: boolean;
+}
+
+/** One source inside an IntegrationExport. `id` is a reference local to the
+ *  export file, only used to reattach a CollectionExport's `sourceIds` — it
+ *  has no relation to any id in a vault that imports it. */
+export interface SourceExport {
+  id: string;
+  name: string;
+  description: string;
+  channel?: string | null; // telegram only
+  url?: string | null; // m3u only
+  allowedExtensions: string[];
+  refreshMinutes?: number | null; // m3u only
+}
+
+export interface CollectionExport {
+  name: string;
+  description: string;
+  icon?: string | null;
+  sourceIds: string[];
+  children: CollectionExport[];
+}
+
+/** The download/upload shape of GET/POST /api/integrations/:id/export|import
+ *  — just what Settings shows for this integration, never the document
+ *  cache. */
+export interface IntegrationExport {
+  sourceType: SourceType;
+  integrationName?: string | null;
+  sources: SourceExport[];
+  collections: CollectionExport[];
 }
 
 export interface IntegrationStatus {

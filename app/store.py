@@ -55,21 +55,37 @@ def save_playlists(playlists: List[Playlist]) -> None:
         _atomic_write(PLAYLISTS_PATH, [p.model_dump() for p in playlists])
 
 
-def load_integrations() -> Optional[List[str]]:
-    """The integration ids this vault has added, or None if it has never
-    said. None and [] are different: None means "not decided yet", so the
-    set can be inferred once from what's already configured, while []
-    means the user genuinely removed them all."""
+def load_integrations() -> Optional[List[dict]]:
+    """The integrations this vault has added, as `{"id", "name"}` records, or
+    None if it has never said. None and [] are
+    different: None means "not decided yet", so the set can be inferred once
+    from what's already configured, while [] means the user genuinely removed
+    them all.
+
+    The file used to be a bare list of ids, before a root node could be
+    renamed. That form is upgraded on read (in memory; persisted by the next
+    write) with `name` left unset for `integrations.name_for` to fill from the
+    catalog — the same lazy-migration approach as `_migrate_source_fields`.
+    """
     if not os.path.exists(INTEGRATIONS_PATH):
         return None
     with open(INTEGRATIONS_PATH) as f:
         raw = json.load(f)
-    return [str(i) for i in raw] if isinstance(raw, list) else None
+    if not isinstance(raw, list):
+        return None
+    entries = []
+    for item in raw:
+        if isinstance(item, str):
+            entries.append({"id": item, "name": None})
+        elif isinstance(item, dict) and item.get("id"):
+            name = item.get("name")
+            entries.append({"id": str(item["id"]), "name": str(name) if name else None})
+    return entries
 
 
-def save_integrations(ids: List[str]) -> None:
+def save_integrations(entries: List[dict]) -> None:
     with _lock:
-        _atomic_write(INTEGRATIONS_PATH, list(ids))
+        _atomic_write(INTEGRATIONS_PATH, [{"id": e["id"], "name": e.get("name")} for e in entries])
 
 
 def _migrate_source_fields(node: dict) -> dict:
