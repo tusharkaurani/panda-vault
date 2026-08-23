@@ -44,7 +44,11 @@ export default function CollectionGrid({
     try {
       await api.collections.reorder(
         parentId,
-        next.map((c) => c.id)
+        next.map((c) => c.id),
+        // At the root, siblings are the roots of one integration's tree
+        // among several. Every card in this grid shares a sourceType, so
+        // the first one names the subset the server should permute.
+        parentId === null ? next[0]?.sourceType : undefined
       );
       snapshot.current = next;
     } catch (e) {

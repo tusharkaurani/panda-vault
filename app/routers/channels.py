@@ -6,7 +6,7 @@ from typing import List, Set
 from fastapi import APIRouter, HTTPException
 
 from .. import cache, jobs, store
-from ..models import Channel, ChannelIn, ChannelOut, ChannelUpdate
+from ..models import TELEGRAM, Channel, ChannelIn, ChannelOut, ChannelUpdate
 from ..telegram_client import join_channel, resolve_and_check, sync_channel
 
 router = APIRouter(prefix="/api/channels", tags=["channels"])
@@ -94,7 +94,7 @@ def _collections_using_channel(collections, channel_id: str):
 
     def walk(nodes):
         for n in nodes:
-            if channel_id in n.channelIds:
+            if n.sourceType == TELEGRAM and channel_id in n.sourceIds:
                 found.append(n)
             if n.children:
                 walk(n.children)
@@ -107,14 +107,19 @@ def _collections_using_channel(collections, channel_id: str):
 def list_channels():
     channels = store.load_channels()
     # One grouped count for every channel rather than a query each.
-    counts = cache.channel_counts([(c.id, c.allowedExtensions) for c in channels])
+    counts = cache.source_counts([(c.id, c.allowedExtensions) for c in channels])
     return [jobs.to_out(c, counts.get(c.id)) for c in channels]
 
 
 @router.post("", response_model=Channel, status_code=201)
 async def create_channel(body: ChannelIn):
     channels = store.load_channels()
-    channel = Channel(name=body.name, description=body.description, channel=body.channel)
+    channel = Channel(
+        name=body.name,
+        description=body.description,
+        channel=body.channel,
+        allowedExtensions=body.allowedExtensions,
+    )
     channel.joined = await resolve_and_check(channel.channel)
     channels.append(channel)
     store.save_channels(channels)
@@ -164,8 +169,8 @@ def delete_channel(channel_id: str, force: bool = False):
     if used_by:
         def unlink(nodes):
             for n in nodes:
-                if channel_id in n.channelIds:
-                    n.channelIds = [c for c in n.channelIds if c != channel_id]
+                if n.sourceType == TELEGRAM and channel_id in n.sourceIds:
+                    n.sourceIds = [c for c in n.sourceIds if c != channel_id]
                 if n.children:
                     unlink(n.children)
 
@@ -208,8 +213,11 @@ async def rebuild_channel(channel_id: str):
     raise HTTPException(404, "Channel not found")
 
 
-@router.get("/rebuild-jobs")
+@router.get("/rebuild-jobs", deprecated=True)
 def rebuild_jobs():
+    """Superseded by GET /api/jobs, which also covers non-Telegram sources.
+    Kept because it is a documented URL, but note it 401s without a live
+    Telegram session — anything polling for jobs should use /api/jobs."""
     return {"jobs": jobs.all_jobs()}
 
 

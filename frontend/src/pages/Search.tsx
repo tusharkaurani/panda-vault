@@ -4,7 +4,7 @@ import { ChevronRight, Home, Loader2 } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { SearchResult } from "../types";
 import { MIN_SEARCH_LENGTH, SEARCH_PAGE_SIZE } from "../lib/search";
-import DocumentRow from "../components/DocumentRow";
+import ItemRow from "../components/ItemRow";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
 
@@ -105,7 +105,7 @@ export default function Search() {
 
       {loading && (
         <div className="flex items-center gap-2 text-panda-muted text-sm">
-          <Loader2 className="animate-spin" size={16} /> Searching across all channel-bound collections…
+          <Loader2 className="animate-spin" size={16} /> Searching across every collection…
         </div>
       )}
 
@@ -125,9 +125,9 @@ export default function Search() {
       {results && results.length > 0 && (
         <div className="flex flex-col gap-2">
           {results.map((r) => (
-            <div key={`${r.channelId}-${r.document.id}`} className="flex flex-col gap-1">
+            <div key={`${r.sourceId}-${r.document.id}`} className="flex flex-col gap-1">
               <span className="text-xs text-panda-muted pl-1">{r.collectionName}</span>
-              <DocumentRow doc={r.document} channelName={r.channelName} />
+              <ItemRow doc={r.document} sourceName={r.sourceName} />
             </div>
           ))}
         </div>

@@ -2,7 +2,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 
-from .. import cache, store
+from .. import cache, sources, store
 from ..models import (
     Collection,
     CollectionIn,
@@ -11,6 +11,7 @@ from ..models import (
     CollectionTreeNode,
     CollectionUpdate,
 )
+from ..models import SourceType as SourceTypeLiteral
 
 router = APIRouter(prefix="/api/collections", tags=["collections"])
 
@@ -48,8 +49,8 @@ def _with_counts(nodes: List[Collection], counts: dict) -> List[CollectionTreeNo
     out = []
     for n in nodes:
         children = _with_counts(n.children, counts)
-        if n.channelIds:
-            file_count = sum(counts.get(cid) or 0 for cid in n.channelIds)
+        if n.sourceIds:
+            file_count = sum(counts.get(sid) or 0 for sid in n.sourceIds)
         else:
             file_count = sum(c.fileCount for c in children)
         out.append(
@@ -64,28 +65,59 @@ def _with_counts(nodes: List[Collection], counts: dict) -> List[CollectionTreeNo
 
 
 @router.get("/tree", response_model=List[CollectionTreeNode])
-def get_tree():
+def get_tree(sourceType: Optional[SourceTypeLiteral] = None):
+    """The whole tree, or one integration's slice of it.
+
+    The root holds one tree per integration side by side; `sourceType`
+    narrows to a single one, which is what every page below the virtual
+    Library node wants. Filtering at the root is enough — `sourceType` is
+    inherited, so a root's descendants all share it.
+    """
     collections = store.load_collections()
-    channels = store.load_channels()
-    # One grouped count for every channel up front. This endpoint is on the
-    # hot path — reloaded on every collection navigation — and previously
-    # walked each bound channel's entire filename list per node just to
-    # produce one integer each.
-    counts = cache.channel_counts([(c.id, c.allowedExtensions) for c in channels])
+    if sourceType:
+        collections = [n for n in collections if n.sourceType == sourceType]
+    # One grouped count for every source of every type up front. This
+    # endpoint is on the hot path — reloaded on every collection navigation
+    # — and previously walked each bound channel's entire filename list per
+    # node just to produce one integer each.
+    all_sources = sources.load_all_by_id()
+    counts = cache.source_counts(sources.scope(all_sources.values()))
     return _with_counts(collections, counts)
 
 
 @router.post("", response_model=Collection, status_code=201)
 def create_collection(body: CollectionIn):
     collections = store.load_collections()
-    node = Collection(name=body.name, description=body.description, icon=body.icon, channelIds=body.channelIds)
-
     if body.parentId:
         parent = _find(collections, body.parentId)
         if not parent:
             raise HTTPException(404, "Parent collection not found")
-        if parent.channelIds:
-            raise HTTPException(400, "Cannot add a sub-collection to a channel-bound collection")
+        if parent.sourceIds:
+            raise HTTPException(400, "Cannot add a sub-collection to a source-bound collection")
+        # A tree belongs to one integration: a child always takes its
+        # parent's type, and asking for a different one is a caller bug
+        # rather than something to silently coerce.
+        if body.sourceType and body.sourceType != parent.sourceType:
+            raise HTTPException(
+                400,
+                f"Parent collection is a {parent.sourceType} collection —"
+                f" a {body.sourceType} sub-collection cannot live inside it",
+            )
+        source_type = parent.sourceType
+    else:
+        if not body.sourceType:
+            raise HTTPException(400, "A root collection must say which sourceType it belongs to")
+        source_type = body.sourceType
+
+    node = Collection(
+        name=body.name,
+        description=body.description,
+        icon=body.icon,
+        sourceType=source_type,
+        sourceIds=body.sourceIds,
+    )
+
+    if body.parentId:
         parent.children.append(node)
     else:
         collections.append(node)
@@ -108,11 +140,11 @@ def update_collection(collection_id: str, body: CollectionUpdate):
         node.description = data["description"]
     if "icon" in data:
         node.icon = data["icon"]
-    if "channelIds" in data:
-        channel_ids = data["channelIds"] or []
-        if channel_ids and node.children:
-            raise HTTPException(400, "Cannot bind channels to a collection that has sub-collections")
-        node.channelIds = channel_ids
+    if "sourceIds" in data:
+        source_ids = data["sourceIds"] or []
+        if source_ids and node.children:
+            raise HTTPException(400, "Cannot bind sources to a collection that has sub-collections")
+        node.sourceIds = source_ids
 
     store.save_collections(collections)
     return node
@@ -143,14 +175,31 @@ def reorder_collections(body: CollectionReorder):
         if not parent:
             raise HTTPException(404, "Parent collection not found")
         siblings = parent.children
+        subset = siblings
     else:
         siblings = collections
+        # The root holds one tree per integration side by side, but the UI
+        # only ever shows (and reorders) one of them at a time. Without
+        # narrowing to that type, `orderedIds` could never match the whole
+        # root level and every root-level reorder would 409.
+        if not body.sourceType:
+            raise HTTPException(400, "A root-level reorder must say which sourceType it covers")
+        subset = [n for n in siblings if n.sourceType == body.sourceType]
 
-    by_id = {n.id: n for n in siblings}
-    if len(body.orderedIds) != len(siblings) or set(body.orderedIds) != set(by_id):
+    by_id = {n.id: n for n in subset}
+    if len(body.orderedIds) != len(subset) or set(body.orderedIds) != set(by_id):
         raise HTTPException(409, "Collection order is out of date — reload and try again")
 
-    siblings[:] = [by_id[cid] for cid in body.orderedIds]
+    if body.parentId:
+        siblings[:] = [by_id[cid] for cid in body.orderedIds]
+    else:
+        # Splice the reordered subset back into the positions it already
+        # occupied, so the other integrations' roots keep their own order
+        # and their place relative to everything else.
+        reordered = iter(by_id[cid] for cid in body.orderedIds)
+        siblings[:] = [
+            next(reordered) if n.sourceType == body.sourceType else n for n in siblings
+        ]
     store.save_collections(collections)
     return None
 
@@ -173,8 +222,14 @@ def move_collection(collection_id: str, body: CollectionMove):
         target = _find(collections, body.parentId)
         if not target:
             raise HTTPException(404, "Target parent collection not found")
-        if target.channelIds:
-            raise HTTPException(400, "Cannot move into a channel-bound collection")
+        if target.sourceIds:
+            raise HTTPException(400, "Cannot move into a source-bound collection")
+        if target.sourceType != node.sourceType:
+            raise HTTPException(
+                400,
+                f"Cannot move a {node.sourceType} collection into a"
+                f" {target.sourceType} one — a tree belongs to one integration",
+            )
         target.children.append(node)
     else:
         collections.append(node)

@@ -1,9 +1,17 @@
 """Pydantic schemas shared across the API."""
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, computed_field
+
+# The kinds of thing a collection can be filled from. Channels and playlists
+# share one id space (both come from new_id()), which is what lets the
+# document cache, jobs.py and cache._scope_sql stay type-agnostic.
+SourceType = Literal["telegram", "m3u"]
+
+TELEGRAM: SourceType = "telegram"
+M3U: SourceType = "m3u"
 
 
 def new_id() -> str:
@@ -51,15 +59,67 @@ class ChannelUpdate(BaseModel):
     allowedExtensions: Optional[List[str]] = None
 
 
+class Playlist(BaseModel):
+    """An M3U playlist — the m3u source type's equivalent of a Channel.
+
+    Deliberately a separate model rather than a `type` field on Channel:
+    the two barely overlap (joined/channel ref vs. a plain URL), and
+    keeping them apart leaves every existing Telegram code path, and
+    channels.json itself, untouched.
+
+    Unlike a channel there is nothing to join and no incremental cursor —
+    a playlist is one HTTP response, so every refresh replaces the whole
+    snapshot (see cache.replace_source_documents).
+    """
+
+    id: str = Field(default_factory=new_id)
+    name: str
+    description: str = ""
+    url: str  # remote .m3u / .m3u8, exactly as entered
+    allowedExtensions: List[str] = Field(default_factory=list)  # matched against the stream URL's extension
+    created_at: float = Field(default_factory=time.time)
+
+
+class PlaylistOut(Playlist):
+    """Response-only shape for GET /api/playlists — mirrors ChannelOut."""
+
+    fileCount: int = 0
+    # unscanned | scanning | rebuilding | ready | empty | error
+    status: str = "unscanned"
+
+
+class PlaylistIn(BaseModel):
+    name: str
+    description: str = ""
+    url: str
+    allowedExtensions: List[str] = Field(default_factory=list)
+
+
+class PlaylistUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    url: Optional[str] = None
+    allowedExtensions: Optional[List[str]] = None
+
+
 class Collection(BaseModel):
     """A collection is either a container (has children) or a leaf bound to
-    one or more channels (has channelIds) — never both."""
+    one or more sources (has sourceIds) — never both.
+
+    `sourceType` is set when the collection is created and inherited by
+    every descendant: a tree belongs to exactly one integration, and its
+    leaves may only bind to sources of that type. Trees of different types
+    sit side by side at the root, under the virtual Library node the UI
+    renders."""
 
     id: str = Field(default_factory=new_id)
     name: str
     description: str = ""
     icon: Optional[str] = None
-    channelIds: List[str] = Field(default_factory=list)
+    sourceType: SourceType = TELEGRAM
+    # Channel ids or playlist ids, according to sourceType. Read off disk as
+    # the legacy `channelIds`/`channelId` — see store._migrate_source_fields.
+    sourceIds: List[str] = Field(default_factory=list)
     children: List["Collection"] = Field(default_factory=list)
 
 
@@ -67,8 +127,10 @@ class CollectionIn(BaseModel):
     name: str
     description: str = ""
     icon: Optional[str] = None
-    channelIds: List[str] = Field(default_factory=list)
+    sourceIds: List[str] = Field(default_factory=list)
     parentId: Optional[str] = None  # None = create at root
+    # Required at the root; inherited from the parent otherwise.
+    sourceType: Optional[SourceType] = None
 
 
 class CollectionUpdate(BaseModel):
@@ -76,7 +138,7 @@ class CollectionUpdate(BaseModel):
     description: Optional[str] = None
     icon: Optional[str] = None
     # Omitted = leave binding untouched. [] explicitly unbinds (becomes a container).
-    channelIds: Optional[List[str]] = None
+    sourceIds: Optional[List[str]] = None
 
 
 class CollectionMove(BaseModel):
@@ -90,6 +152,10 @@ class CollectionReorder(BaseModel):
 
     parentId: Optional[str] = None  # None = the root level
     orderedIds: List[str]
+    # Root level only: which source type's roots `orderedIds` covers. The
+    # root now holds one tree per integration, so a reorder that spans all
+    # of them would never match a single tree's members.
+    sourceType: Optional[SourceType] = None
 
 
 class CollectionTreeNode(Collection):
@@ -102,15 +168,25 @@ class CollectionTreeNode(Collection):
 
 
 class DocumentOut(BaseModel):
+    """One item in a collection — a Telegram document, or an M3U stream
+    entry. The m3u-only fields are None for documents and vice versa."""
+
     id: int
     name: str
     size: int
     date: str
     mime_type: Optional[str] = None
-    # Set by the cache query layer when returning docs (it's the partition
+    # Set by the cache query layer when returning items (it's the partition
     # key, so it's never stored per-row) — the routers rely on it to build
-    # download URLs.
-    channelId: Optional[str] = None
+    # download URLs. Holds a channel id or a playlist id, per sourceType.
+    sourceId: Optional[str] = None
+    sourceType: SourceType = TELEGRAM
+    # m3u only. `id` is then the entry's 1-based ordinal within the playlist
+    # snapshot rather than a Telegram message id, and `size` is 0 — a stream
+    # has no length to report.
+    url: Optional[str] = None
+    logo: Optional[str] = None
+    group: Optional[str] = None
 
     @computed_field
     @property

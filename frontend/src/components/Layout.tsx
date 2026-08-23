@@ -82,7 +82,7 @@ export default function Layout({ children }: { children: ReactNode }) {
       <main className="flex-1 mx-auto w-full max-w-6xl px-4 py-6">{children}</main>
 
       <footer className="border-t border-panda-border py-4 text-center text-xs text-panda-muted">
-        Panda Vault — self-hosted Telegram document library
+        Panda Vault — self-hosted library for Telegram channels and M3U playlists
       </footer>
     </div>
   );

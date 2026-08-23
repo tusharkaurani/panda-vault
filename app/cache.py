@@ -1,10 +1,10 @@
-"""SQLite-backed store for per-channel document listings.
+"""SQLite-backed store for per-source item listings.
 
 Avoids re-scanning a Telegram channel's full message history on every
 collection open (slow + risks Telegram FloodWait rate limiting). Unlike a
 short TTL cache, entries here don't expire on their own — they're kept
-fresh by a periodic background refresh loop (see
-telegram_client.start_refresh_loop) and survive process restarts.
+fresh by a periodic background refresh loop (see refresh.py) and survive
+process restarts.
 Callers can still force a live bypass (e.g. a "Refresh" button in the
 UI, or a cache miss for a brand new channel).
 
@@ -34,7 +34,7 @@ DB_PATH = os.path.join(CONFIG_DIR, "documents.db")
 LEGACY_JSON_PATH = os.path.join(CONFIG_DIR, "document_cache.json")
 LEGACY_BACKUP_PATH = LEGACY_JSON_PATH + ".bak"
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = 2
 
 log = logging.getLogger("panda_vault.cache")
 
@@ -49,11 +49,13 @@ log = logging.getLogger("panda_vault.cache")
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.RLock()
 
-# (channel_id, allowed_extensions) — the unit every read query works in.
+# (source_id, allowed_extensions) — the unit every read query works in.
+# A source is a Telegram channel or an M3U playlist; they share one id
+# space, so nothing below this line needs to know which it is dealing with.
 # Extensions are applied at *query* time rather than baked into the rows,
 # so editing a channel's allowlist in Settings takes effect immediately
 # without a re-scan or re-index.
-ChannelScope = Tuple[str, Sequence[str]]
+SourceScope = Tuple[str, Sequence[str]]
 
 _TABLES = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -77,6 +79,41 @@ CREATE TABLE IF NOT EXISTS channels_meta (
 CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
+# Schema changes after the initial `_TABLES` shape, applied in order by
+# _migrate(). Version 1 *is* `_TABLES`, so it has no entry here: a fresh
+# database gets the v1 shape from the executescript above and then walks
+# the same migration path an existing one does, which keeps a single code
+# path rather than two shapes that have to be kept in agreement.
+#
+# Each step is (table, column, statement) so it can be skipped when the
+# column is already there — ALTER TABLE ... ADD COLUMN is not idempotent
+# and raises "duplicate column name" on a second run.
+_MIGRATIONS = {
+    2: [
+        # M3U entries carry a stream URL, a logo and a group instead of a
+        # downloadable file. Nullable, so every existing Telegram row stays
+        # valid without a rewrite.
+        ("documents", "url", "ALTER TABLE documents ADD COLUMN url TEXT"),
+        ("documents", "logo", "ALTER TABLE documents ADD COLUMN logo TEXT"),
+        ("documents", "group_title", "ALTER TABLE documents ADD COLUMN group_title TEXT"),
+        # Stored rather than derived from `url IS NOT NULL`: search returns
+        # rows from both source types in one query, and each row has to know
+        # how to render itself without a lookup back to the source list.
+        (
+            "documents",
+            "source_type",
+            "ALTER TABLE documents ADD COLUMN source_type TEXT NOT NULL DEFAULT 'telegram'",
+        ),
+    ],
+}
+
+_MIGRATION_INDEXES = {
+    2: [
+        "CREATE INDEX IF NOT EXISTS idx_documents_ch_group ON documents(channel_id, group_title)",
+    ],
+}
+
+
 # Created after a bulk import rather than before — building them once over
 # a finished table is cheaper than maintaining them across 150k inserts.
 _INDEXES = """
@@ -84,7 +121,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_ch_date ON documents(channel_id, date);
 CREATE INDEX IF NOT EXISTS idx_documents_ch_name ON documents(channel_id, name_lower);
 CREATE INDEX IF NOT EXISTS idx_documents_ch_ext  ON documents(channel_id, ext);
 """
-# idx_documents_ch_ext covers channel_counts() — the single hottest query,
+# idx_documents_ch_ext covers source_counts() — the single hottest query,
 # hit by the collection tree on every navigation and by the polled channel
 # list. Counting straight off the index rather than the table measured
 # 41ms -> 26ms across ~150k documents, for no meaningful disk cost.
@@ -108,6 +145,10 @@ _SORTS = {
     "name_desc": "name_lower DESC, channel_id ASC, msg_id DESC",
     "size_desc": "size DESC, channel_id ASC, msg_id DESC",
     "size_asc": "size ASC, channel_id ASC, msg_id ASC",
+    # m3u only in practice: Telegram documents have no group. NULLs sort
+    # last in both directions so ungrouped entries never head the list.
+    "group_asc": "group_title IS NULL, group_title ASC, name_lower ASC, channel_id ASC, msg_id ASC",
+    "group_desc": "group_title IS NULL, group_title DESC, name_lower ASC, channel_id ASC, msg_id DESC",
 }
 _DEFAULT_SORT = "date_desc"
 
@@ -125,7 +166,7 @@ def normalize_extensions(allowed: Sequence[str]) -> List[str]:
     return sorted({ext.lower().lstrip(".") for ext in allowed})
 
 
-def _scope_sql(scope: Sequence[ChannelScope]) -> Tuple[str, list]:
+def _scope_sql(scope: Sequence[SourceScope]) -> Tuple[str, list]:
     """Build the WHERE fragment restricting a query to a set of channels,
     each with its own extension allowlist. Channels sharing an allowlist
     collapse into one branch, so the common case (a handful of distinct
@@ -173,6 +214,13 @@ def _search_terms(search: str) -> List[str]:
     return terms[:_MAX_SEARCH_TERMS]
 
 
+# Every read goes through this list, so the column order can never drift
+# out of step with _row_to_doc below.
+_DOC_COLUMNS = (
+    "channel_id, msg_id, name, size, date, mime_type, source_type, url, logo, group_title"
+)
+
+
 def _row_to_doc(row: sqlite3.Row) -> DocumentOut:
     return DocumentOut(
         id=row["msg_id"],
@@ -180,7 +228,11 @@ def _row_to_doc(row: sqlite3.Row) -> DocumentOut:
         size=row["size"],
         date=row["date"],
         mime_type=row["mime_type"],
-        channelId=row["channel_id"],
+        sourceId=row["channel_id"],
+        sourceType=row["source_type"],
+        url=row["url"],
+        logo=row["logo"],
+        group=row["group_title"],
     )
 
 
@@ -245,11 +297,7 @@ def _quarantine_db() -> None:
 
 def _bootstrap() -> None:
     _conn.executescript(_TABLES)
-    _conn.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('version', ?)"
-        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (SCHEMA_VERSION,),
-    )
+    _migrate()
 
     # Any row at all means the import already happened. This — not the
     # presence of the JSON file — is the idempotency guard, so a rename
@@ -272,6 +320,37 @@ def _bootstrap() -> None:
 
     _conn.executescript(_INDEXES)
     _conn.execute("ANALYZE")
+
+
+def _migrate() -> None:
+    """Bring the schema up to SCHEMA_VERSION, then record that it is there.
+
+    Versions before this runner existed wrote `version` into schema_meta but
+    never read it back, so an in-the-wild 2.x database reports "1" and a
+    brand new one reports nothing at all. Both are handled by the same walk:
+    a missing row means 0, and the range below simply starts one step later
+    for the database that already claims 1.
+    """
+    row = _conn.execute("SELECT value FROM schema_meta WHERE key='version'").fetchone()
+    try:
+        current = int(row[0]) if row else 0
+    except (TypeError, ValueError):
+        current = 0
+
+    for version in range(current + 1, SCHEMA_VERSION + 1):
+        for table, column, statement in _MIGRATIONS.get(version, []):
+            existing = {r[1] for r in _conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                _conn.execute(statement)
+        for statement in _MIGRATION_INDEXES.get(version, []):
+            _conn.execute(statement)
+        log.info("Applied schema migration %d", version)
+
+    _conn.execute(
+        "INSERT INTO schema_meta(key, value) VALUES('version', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(SCHEMA_VERSION),),
+    )
 
 
 def _import_legacy_json(path: str) -> None:
@@ -372,7 +451,7 @@ def close() -> None:
 
 
 def query_documents(
-    scope: Sequence[ChannelScope],
+    scope: Sequence[SourceScope],
     search: Optional[str] = None,
     sort: str = _DEFAULT_SORT,
     offset: int = 0,
@@ -396,14 +475,14 @@ def query_documents(
     with _lock:
         total = _conn.execute(f"SELECT COUNT(*) FROM documents WHERE {where}", params).fetchone()[0]
         rows = _conn.execute(
-            "SELECT channel_id, msg_id, name, size, date, mime_type FROM documents"
+            f"SELECT {_DOC_COLUMNS} FROM documents"
             f" WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
             params + [limit, offset],
         ).fetchall()
     return [_row_to_doc(r) for r in rows], total
 
 
-def channel_counts(scope: Sequence[ChannelScope]) -> Dict[str, Optional[int]]:
+def source_counts(scope: Sequence[SourceScope]) -> Dict[str, Optional[int]]:
     """Document count per channel, honouring each one's extension allowlist.
 
     None means "never scanned", which the UI shows differently from a
@@ -440,7 +519,7 @@ def count_documents(channel_id: str) -> int:
         ).fetchone()[0]
 
 
-def iter_names(scope: Sequence[ChannelScope]) -> Iterator[str]:
+def iter_names(scope: Sequence[SourceScope]) -> Iterator[str]:
     """Stream filenames across `scope` for keyword extraction — streamed
     rather than returned as a list so a 66k-document collection never
     materializes all of its names at once."""
@@ -450,7 +529,7 @@ def iter_names(scope: Sequence[ChannelScope]) -> Iterator[str]:
             yield row[0]
 
 
-def has_channel(channel_id: str) -> bool:
+def has_source(channel_id: str) -> bool:
     """Whether this channel has ever been scanned. A channel with a meta row
     but zero documents is 'scanned and empty', not 'unscanned'."""
     with _lock:
@@ -520,6 +599,73 @@ def upsert_documents(channel_id: str, docs: Sequence[DocumentOut]) -> None:
         except Exception:
             _conn.execute("ROLLBACK")
             raise
+
+
+def _stream_ext(doc: DocumentOut) -> Optional[str]:
+    """Extension for an M3U entry, taken from its stream URL rather than its
+    display name — a channel called "BBC News HD" has no extension, but the
+    URL it points at ends in .m3u8/.ts/.mp4. That is what a playlist's
+    allowedExtensions is matched against, so "only .m3u8 streams" works the
+    same way "only .pdf files" does for a channel."""
+    if not doc.url:
+        return _ext_of(doc.name)
+    path = doc.url.split("?", 1)[0].split("#", 1)[0]
+    return _ext_of(path.rsplit("/", 1)[-1])
+
+
+def replace_source_documents(source_id: str, docs: Sequence[DocumentOut]) -> int:
+    """Replace everything cached for one source with `docs`, atomically.
+
+    An M3U playlist is a single HTTP response describing its *entire*
+    contents, so a refresh is a snapshot swap rather than the incremental
+    add upsert_documents does — an entry the provider dropped has to
+    actually disappear, and there is no equivalent of Telegram's message-id
+    cursor to scan forward from.
+
+    Delete and insert share one transaction: if the insert fails the
+    previous snapshot is still there, which matters because the fetch that
+    produced `docs` came off the network and may well have been truncated.
+    """
+    rows = [
+        (
+            source_id,
+            d.id,
+            d.name,
+            d.name.lower(),
+            _stream_ext(d),
+            d.size,
+            d.date,
+            d.mime_type,
+            d.sourceType,
+            d.url,
+            d.logo,
+            d.group,
+        )
+        for d in docs
+    ]
+    with _lock:
+        _conn.execute("BEGIN")
+        try:
+            _conn.execute("DELETE FROM documents WHERE channel_id = ?", (source_id,))
+            _conn.executemany(
+                "INSERT INTO documents"
+                "(channel_id, msg_id, name, name_lower, ext, size, date, mime_type,"
+                " source_type, url, logo, group_title)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                rows,
+            )
+            # max_id is meaningless for a snapshot source, but the column is
+            # NOT NULL and has_source() keys off the row existing at all.
+            _conn.execute(
+                "INSERT INTO channels_meta(channel_id, fetched_at, max_id) VALUES(?,?,0)"
+                " ON CONFLICT(channel_id) DO UPDATE SET fetched_at=excluded.fetched_at",
+                (source_id, time.time()),
+            )
+            _conn.execute("COMMIT")
+        except Exception:
+            _conn.execute("ROLLBACK")
+            raise
+    return len(rows)
 
 
 def set_cursor(channel_id: str, max_id: int) -> None:

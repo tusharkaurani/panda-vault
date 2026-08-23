@@ -26,9 +26,17 @@ CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config")
 SESSION_PATH = os.path.join(CONFIG_DIR, "session")
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-CACHE_REFRESH_SECONDS = int(os.environ.get("TG_CACHE_REFRESH_SECONDS", "1800"))  # 30 min
+# Optional, not required. Telegram is one integration among several now,
+# and an install that only uses M3U playlists has no reason to hold a
+# Telegram API key — reading these eagerly used to abort startup for
+# everyone who didn't. Unset means "the integration is not configured",
+# which surfaces through configured() and is what the UI reports.
+_RAW_API_ID = os.environ.get("TG_API_ID", "").strip()
+API_HASH = os.environ.get("TG_API_HASH", "").strip()
+try:
+    API_ID = int(_RAW_API_ID) if _RAW_API_ID else 0
+except ValueError:
+    API_ID = 0
 _PROGRESS_EVERY = 100  # documents between partial cache writes / progress updates
 # Telegram's "Files" category: plain file attachments, excluding the media
 # it classifies separately (video/music/voice/GIF/round video).
@@ -41,12 +49,23 @@ _FILE_FILTER = InputMessagesFilterDocument()
 # disconnected" and only restarting the process brings it back. This app is a
 # long-lived unattended container, so outlasting the outage is always what we
 # want.
-client = TelegramClient(
-    SESSION_PATH, API_ID, API_HASH, connection_retries=None, retry_delay=5
+def configured() -> bool:
+    """Whether TG_API_ID / TG_API_HASH were supplied at all. Distinct from
+    is_authorized(): unconfigured means there is nothing to log in *to*, so
+    the UI offers setup instructions rather than a login form."""
+    return bool(API_ID and API_HASH)
+
+
+# None when the integration isn't configured. Constructing a client eagerly
+# would create config/session.session for installs that never use Telegram,
+# and every entry point below already has to handle "not connected" anyway.
+client: Optional[TelegramClient] = (
+    TelegramClient(SESSION_PATH, API_ID, API_HASH, connection_retries=None, retry_delay=5)
+    if configured()
+    else None
 )
 log = logging.getLogger("panda_vault.telegram_client")
 
-_refresh_task: Optional[asyncio.Task] = None
 _connect_lock = asyncio.Lock()
 _last_connect_failure: Optional[float] = None
 _stopping = False
@@ -68,6 +87,17 @@ def _lock_for(channel_id: str) -> asyncio.Lock:
 _INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)([\w-]+)", re.IGNORECASE)
 
 
+def _require_client() -> TelegramClient:
+    """For the paths that talk to Telegram directly rather than going
+    through ensure_connected() — they'd otherwise fail on None with an
+    AttributeError instead of something a user can act on."""
+    if client is None:
+        raise RuntimeError(
+            "Telegram is not configured — set TG_API_ID and TG_API_HASH to enable it"
+        )
+    return client
+
+
 async def start() -> None:
     """Connect only — never blocks on interactive login. First-run auth is
     driven through the /api/auth endpoints (web login flow) instead of a
@@ -79,13 +109,17 @@ async def start() -> None:
     when ensure_connected() will pick the connection up on its own as soon
     as the network is back.
     """
+    if not configured():
+        log.info("Telegram is not configured (no TG_API_ID / TG_API_HASH) — skipping connect")
+        return
     await ensure_connected()
 
 
 async def stop() -> None:
     global _stopping
     _stopping = True
-    await client.disconnect()
+    if client is not None:
+        await client.disconnect()
 
 
 async def ensure_connected() -> bool:
@@ -99,7 +133,7 @@ async def ensure_connected() -> bool:
     disconnected" until the container is restarted.
     """
     global _last_connect_failure
-    if _stopping:
+    if client is None or _stopping:
         return False
     if client.is_connected():
         return True
@@ -146,6 +180,7 @@ async def send_code(phone: str) -> None:
     # the one group of endpoints that never passes through ensure_connected()
     # on its way in — and they are exactly what a user reaches for when a lost
     # connection has bounced them back to the login screen.
+    _require_client()
     await ensure_connected()
     _login_phone = phone
     await client.send_code_request(phone)
@@ -154,6 +189,7 @@ async def send_code(phone: str) -> None:
 async def sign_in_code(code: str) -> bool:
     """Returns True if fully signed in, False if the account needs a 2FA
     password next (call sign_in_password)."""
+    _require_client()
     if not _login_phone:
         raise RuntimeError("Send a login code first")
     await ensure_connected()
@@ -165,6 +201,7 @@ async def sign_in_code(code: str) -> bool:
 
 
 async def sign_in_password(password: str) -> None:
+    _require_client()
     await ensure_connected()
     await client.sign_in(password=password)
 
@@ -176,6 +213,7 @@ async def qr_login_start() -> Tuple[str, float]:
     continuously — polling `wait()` itself per HTTP request would leave
     gaps where a scan could be missed. Returns (url, expires_epoch)."""
     global _qr, _qr_task, _qr_result
+    _require_client()
     await ensure_connected()
     if _qr_task and not _qr_task.done():
         _qr_task.cancel()
@@ -213,6 +251,7 @@ def _get_filename(document) -> str:
 
 
 async def _resolve_entity(channel_ref: str):
+    _require_client()
     ref = channel_ref.strip()
     m = _INVITE_RE.match(ref)
     if m:
@@ -234,6 +273,8 @@ async def resolve_and_check(channel_ref: str) -> bool:
 
 
 async def join_channel(channel_ref: str) -> Tuple[bool, str]:
+    if client is None:
+        return False, "Telegram is not configured — set TG_API_ID and TG_API_HASH to enable it"
     ref = channel_ref.strip()
     try:
         m = _INVITE_RE.match(ref)
@@ -336,7 +377,7 @@ async def sync_channel(
     # merge) so a corrupted/stale cache can be thrown away and rebuilt from
     # a clean full history scan — force_refresh alone only does an
     # incremental min_id-based top-up against the existing cache.
-    known = False if full_rebuild else cache.has_channel(channel_id)
+    known = False if full_rebuild else cache.has_source(channel_id)
     if known and not force_refresh:
         return cache.count_documents(channel_id)
 
@@ -345,7 +386,7 @@ async def sync_channel(
     # running a full history scan against Telegram — the loser just waits
     # and gets served whatever the winner produced.
     async with _lock_for(channel_id):
-        known = False if full_rebuild else cache.has_channel(channel_id)
+        known = False if full_rebuild else cache.has_source(channel_id)
         if known and not force_refresh:
             return cache.count_documents(channel_id)
 
@@ -415,6 +456,7 @@ async def sync_channel(
 
 
 async def download_stream(channel_ref: str, msg_id: int):
+    _require_client()
     entity = await _resolve_entity(channel_ref)
     message = await client.get_messages(entity, ids=msg_id)
     if not message or not message.document:
@@ -429,33 +471,3 @@ async def download_stream(channel_ref: str, msg_id: int):
             yield chunk
 
     return gen, filename, size, mime
-
-
-async def _refresh_all_once() -> None:
-    if not await is_authorized():
-        return
-    for channel in store.load_channels():
-        try:
-            await sync_channel(channel.id, channel.channel, force_refresh=True)
-        except Exception as e:
-            log.warning("Background refresh failed for channel %s: %s", channel.id, e)
-        await asyncio.sleep(2)  # spread calls out instead of bursting Telegram
-
-
-async def _refresh_loop() -> None:
-    while True:
-        try:
-            await _refresh_all_once()
-        except Exception as e:
-            log.warning("Background refresh cycle errored: %s", e)
-        await asyncio.sleep(CACHE_REFRESH_SECONDS)
-
-
-def start_refresh_loop() -> None:
-    global _refresh_task
-    _refresh_task = asyncio.create_task(_refresh_loop())
-
-
-def stop_refresh_loop() -> None:
-    if _refresh_task:
-        _refresh_task.cancel()

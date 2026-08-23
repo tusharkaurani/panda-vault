@@ -1,34 +1,39 @@
 import { FormEvent, useState } from "react";
-import type { Channel } from "../types";
+import type { Playlist } from "../types";
 import ExtensionPills from "./ExtensionPills";
 
-export interface ChannelFormValues {
+export interface PlaylistFormValues {
   name: string;
   description: string;
-  channel: string;
+  url: string;
   allowedExtensions: string[];
 }
 
-export default function ChannelForm({
+export default function PlaylistForm({
   initial,
   onSubmit,
   onCancel,
   submitting,
 }: {
-  initial?: Channel;
-  onSubmit: (values: ChannelFormValues) => void;
+  initial?: Playlist;
+  onSubmit: (values: PlaylistFormValues) => void;
   onCancel: () => void;
   submitting?: boolean;
 }) {
   const [name, setName] = useState(initial?.name ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
-  const [channel, setChannel] = useState(initial?.channel ?? "");
+  const [url, setUrl] = useState(initial?.url ?? "");
   const [extensions, setExtensions] = useState<string[]>(initial?.allowedExtensions ?? []);
 
   function submit(e: FormEvent) {
     e.preventDefault();
-    if (!name.trim() || !channel.trim()) return;
-    onSubmit({ name: name.trim(), description: description.trim(), channel: channel.trim(), allowedExtensions: extensions });
+    if (!name.trim() || !url.trim()) return;
+    onSubmit({
+      name: name.trim(),
+      description: description.trim(),
+      url: url.trim(),
+      allowedExtensions: extensions,
+    });
   }
 
   return (
@@ -39,17 +44,18 @@ export default function ChannelForm({
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. Economic Times"
+            placeholder="e.g. Live TV"
             required
             className="bg-panda-surface border border-panda-border rounded-lg px-3 py-2 outline-none focus:border-panda-accent"
           />
         </label>
         <label className="flex flex-col gap-1 text-sm">
-          <span className="text-panda-muted">Channel ID / username / invite link</span>
+          <span className="text-panda-muted">Playlist URL</span>
           <input
-            value={channel}
-            onChange={(e) => setChannel(e.target.value)}
-            placeholder="@channelname, -100123456789, or t.me/joinchat/…"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            type="url"
+            placeholder="https://example.com/playlist.m3u"
             required
             className="bg-panda-surface border border-panda-border rounded-lg px-3 py-2 outline-none focus:border-panda-accent font-mono text-xs"
           />
@@ -60,11 +66,17 @@ export default function ChannelForm({
         <input
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          placeholder="Optional notes about this channel"
+          placeholder="Optional notes about this playlist"
           className="bg-panda-surface border border-panda-border rounded-lg px-3 py-2 outline-none focus:border-panda-accent"
         />
       </label>
-      <ExtensionPills value={extensions} onChange={setExtensions} />
+      <ExtensionPills
+        value={extensions}
+        onChange={setExtensions}
+        label="Allowed stream extensions (optional)"
+        hint="Matched against the stream URL, not the channel name — e.g. m3u8 to hide direct .ts feeds. Leave empty to show everything."
+        placeholder="m3u8, ts, …"
+      />
       <div className="flex items-center gap-2 justify-end">
         <button type="button" onClick={onCancel} className="px-3 py-1.5 text-sm rounded-lg border border-panda-border hover:border-panda-muted">
           Cancel
@@ -74,7 +86,7 @@ export default function ChannelForm({
           disabled={submitting}
           className="px-3 py-1.5 text-sm rounded-lg bg-panda-accent text-panda-bg font-medium hover:opacity-90 disabled:opacity-50"
         >
-          {initial ? "Save changes" : "Add channel"}
+          {initial ? "Save changes" : "Add playlist"}
         </button>
       </div>
     </form>

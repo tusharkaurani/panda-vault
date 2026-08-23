@@ -17,7 +17,13 @@ log = logging.getLogger("panda_vault.auth")
 
 @router.get("/status")
 async def status():
-    return {"authorized": await telegram_client.is_authorized()}
+    """`configured` is not the same as `authorized`: without TG_API_ID /
+    TG_API_HASH there is nothing to log in to, so the UI shows setup
+    instructions rather than a login form that could never succeed."""
+    return {
+        "configured": telegram_client.configured(),
+        "authorized": await telegram_client.is_authorized(),
+    }
 
 
 @router.post("/send-code")

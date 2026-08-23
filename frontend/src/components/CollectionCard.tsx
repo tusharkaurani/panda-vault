@@ -9,6 +9,7 @@ import {
   Archive,
   GripVertical,
   Radio,
+  Tv,
 } from "lucide-react";
 import type { Collection } from "../types";
 import Tooltip from "./Tooltip";
@@ -34,8 +35,14 @@ export interface DragHandlers {
 
 function countParts(collection: Collection): string[] {
   const fileCount = collection.fileCount ?? 0;
-  const fileLabel = `${fileCount.toLocaleString()} file${fileCount === 1 ? "" : "s"}`;
-  if (collection.channelIds.length > 0) return [fileLabel];
+  // An M3U collection holds live streams, not files — counting them in
+  // "files" reads as though something is downloadable when nothing is.
+  const unit =
+    collection.sourceType === "m3u"
+      ? fileCount === 1 ? "entry" : "entries"
+      : fileCount === 1 ? "file" : "files";
+  const fileLabel = `${fileCount.toLocaleString()} ${unit}`;
+  if (collection.sourceIds.length > 0) return [fileLabel];
   const folderCount = collection.folderCount ?? collection.children.length;
   return [`${folderCount.toLocaleString()} collection${folderCount === 1 ? "" : "s"}`, fileLabel];
 }
@@ -46,8 +53,9 @@ function countParts(collection: Collection): string[] {
  *  a document list. */
 const CollectionCard = forwardRef<HTMLDivElement, { collection: Collection; drag?: DragHandlers }>(
   function CollectionCard({ collection, drag }, ref) {
-    const isChannel = collection.channelIds.length > 0;
-    const Icon = isChannel ? Radio : (collection.icon && ICONS[collection.icon]) || FolderIcon;
+    const isBound = collection.sourceIds.length > 0;
+    const BoundIcon = collection.sourceType === "m3u" ? Tv : Radio;
+    const Icon = isBound ? BoundIcon : (collection.icon && ICONS[collection.icon]) || FolderIcon;
 
     return (
       <div

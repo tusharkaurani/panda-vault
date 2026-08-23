@@ -6,7 +6,16 @@ import ErrorBanner from "../components/ErrorBanner";
 
 type Step = "phone" | "code" | "password";
 
-export default function Login({ onSuccess }: { onSuccess: () => void }) {
+export default function Login({
+  onSuccess,
+  embedded = false,
+}: {
+  onSuccess: () => void;
+  /** Rendered inside Settings rather than as the first-run gate: drop the
+   *  full-viewport centering and the app masthead, which the page already
+   *  has. The flow itself is identical. */
+  embedded?: boolean;
+}) {
   const [step, setStep] = useState<Step>("phone");
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
@@ -126,15 +135,17 @@ export default function Login({ onSuccess }: { onSuccess: () => void }) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <div className={`w-full flex flex-col gap-6 ${step === "phone" ? "max-w-2xl" : "max-w-sm"}`}>
-        <div className="flex flex-col items-center gap-2 text-center">
-          <span className="text-3xl" aria-hidden="true">🐼</span>
-          <h1 className="text-xl font-semibold">Panda Vault</h1>
-          <p className="text-sm text-panda-muted flex items-center gap-1.5">
-            <ShieldCheck size={14} /> One-time Telegram login to activate this instance
-          </p>
-        </div>
+    <div className={embedded ? "" : "min-h-screen flex items-center justify-center px-4"}>
+      <div className={`w-full flex flex-col gap-6 ${embedded ? "" : step === "phone" ? "max-w-2xl" : "max-w-sm"}`}>
+        {!embedded && (
+          <div className="flex flex-col items-center gap-2 text-center">
+            <span className="text-3xl" aria-hidden="true">🐼</span>
+            <h1 className="text-xl font-semibold">Panda Vault</h1>
+            <p className="text-sm text-panda-muted flex items-center gap-1.5">
+              <ShieldCheck size={14} /> One-time Telegram login to activate this instance
+            </p>
+          </div>
+        )}
 
         {error && <ErrorBanner message={error} />}
 

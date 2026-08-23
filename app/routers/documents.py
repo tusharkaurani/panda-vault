@@ -4,9 +4,9 @@ from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException
 
-from .. import cache, jobs, store
+from .. import cache, jobs, m3u, sources, store, telegram_client
 from ..keywords import top_keywords
-from ..models import Collection
+from ..models import M3U, TELEGRAM, Collection
 from ..telegram_client import sync_channel
 
 router = APIRouter(prefix="/api/collections", tags=["documents"])
@@ -35,13 +35,10 @@ async def get_keywords(collection_id: str, limit: int = 8):
     node = _find(collections, collection_id)
     if not node:
         raise HTTPException(404, "Collection not found")
-    if not node.channelIds:
+    if not node.sourceIds:
         return {"keywords": []}
 
-    channels_by_id = {c.id: c for c in store.load_channels()}
-    scope = [
-        (cid, channels_by_id[cid].allowedExtensions) for cid in node.channelIds if cid in channels_by_id
-    ]
+    scope = sources.scope(sources.bound(node, sources.load_by_id(node.sourceType)))
     limit = max(1, min(limit, 20))
 
     # Tokenizing every filename in a large collection takes ~0.1s, and this
@@ -58,6 +55,46 @@ def _keywords_for(stamp: tuple, limit: int) -> List[dict]:
     return top_keywords(cache.iter_names(scope), limit)
 
 
+async def _sync_bound(bound, source_type, refresh: bool) -> List[str]:
+    """Bring the bound sources up to date before reading, returning one
+    human-readable line per source that couldn't be reached.
+
+    Only talks to the network when there's a reason to: an explicit
+    Refresh, or a source nobody has ever scanned. Otherwise this is a pure
+    database read.
+    """
+    errors: List[str] = []
+
+    if source_type == M3U:
+        for playlist in bound:
+            if not (refresh or not cache.has_source(playlist.id)):
+                continue
+            try:
+                await m3u.sync_playlist(playlist.id, playlist.url, force_refresh=refresh)
+            except RuntimeError as e:
+                errors.append(f"{playlist.name}: {e}")
+        return errors
+
+    # Telegram is optional now, so a logged-out install still has to be able
+    # to browse what it scanned earlier — serve the cached rows and say why
+    # they might be stale, rather than failing the whole collection.
+    if not await telegram_client.is_authorized():
+        if refresh:
+            errors.append(
+                "Telegram is not connected — showing what was cached. Connect it in Settings."
+            )
+        return errors
+
+    for channel in bound:
+        if not (refresh or not cache.has_source(channel.id)):
+            continue
+        try:
+            await sync_channel(channel.id, channel.channel, force_refresh=refresh)
+        except RuntimeError as e:
+            errors.append(f"{channel.name}: {e}")
+    return errors
+
+
 @router.get("/{collection_id}/documents")
 async def get_documents(
     collection_id: str,
@@ -71,27 +108,15 @@ async def get_documents(
     node = _find(collections, collection_id)
     if not node:
         raise HTTPException(404, "Collection not found")
-    if not node.channelIds:
-        raise HTTPException(400, "Collection is a container, not bound to any channel")
+    if not node.sourceIds:
+        raise HTTPException(400, "Collection is a container, not bound to any source")
 
-    channels_by_id = {c.id: c for c in store.load_channels()}
-    bound_channels = [channels_by_id[cid] for cid in node.channelIds if cid in channels_by_id]
-    if not bound_channels:
-        raise HTTPException(409, "None of this collection's channels exist anymore — rebind it in Settings")
+    bound = sources.bound(node, sources.load_by_id(node.sourceType))
+    if not bound:
+        raise HTTPException(409, "None of this collection's sources exist anymore — rebind it in Settings")
 
-    # Only talk to Telegram when there's a reason to: an explicit Refresh,
-    # or a channel nobody has ever scanned. Otherwise this is a pure
-    # database read.
-    errors: List[str] = []
-    for channel in bound_channels:
-        if not (refresh or not cache.has_channel(channel.id)):
-            continue
-        try:
-            await sync_channel(channel.id, channel.channel, force_refresh=refresh)
-        except RuntimeError as e:
-            errors.append(f"{channel.name}: {e}")
-
-    scope = [(c.id, c.allowedExtensions) for c in bound_channels]
+    errors: List[str] = await _sync_bound(bound, node.sourceType, refresh)
+    scope = sources.scope(bound)
     offset = max(0, offset)
     limit = max(1, min(limit, 100))
     # Extension allowlist, substring search, ordering and paging all happen
@@ -99,14 +124,14 @@ async def get_documents(
     page, total = await asyncio.to_thread(
         cache.query_documents, scope, search, sort, offset, limit
     )
-    counts = cache.channel_counts(scope)
+    counts = cache.source_counts(scope)
 
     if not total and errors:
         raise HTTPException(502, "; ".join(errors))
 
     return {
         "collection": node,
-        "channels": [jobs.to_out(c, counts.get(c.id)) for c in bound_channels],
+        "sources": [jobs.to_source_out(s, node.sourceType, counts.get(s.id)) for s in bound],
         "documents": page,
         "total": total,
         "offset": offset,

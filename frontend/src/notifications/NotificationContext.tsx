@@ -28,7 +28,7 @@ interface NotificationContextValue {
   // Live scan/rebuild jobs keyed by channel, plus a counter that ticks
   // whenever one finishes — components use it as an effect dependency to
   // refetch the counts a completed scan just changed.
-  jobsByChannel: Record<string, RebuildJob>;
+  jobsBySource: Record<string, RebuildJob>;
   jobsCompleted: number;
   markAllRead: () => void;
   dismissNotification: (id: string) => void;
@@ -61,7 +61,16 @@ function loadSeenJobs(): Set<string> {
 /** A channel's first pass is a "Scan"; a manual full pass over a channel
  *  that was already cached is a "Rescan". */
 function verb(job: RebuildJob): string {
+  // A playlist is fetched whole rather than scanned message by message, and
+  // the notification is the only place a user sees the work named.
+  if (job.sourceType === "m3u") return job.kind === "rebuild" ? "Re-fetch" : "Fetch";
   return job.kind === "rebuild" ? "Rescan" : "Scan";
+}
+
+function counted(job: RebuildJob): string {
+  const n = job.scanned.toLocaleString();
+  if (job.sourceType === "m3u") return `${n} ${job.scanned === 1 ? "entry" : "entries"}`;
+  return `${n} file${job.scanned === 1 ? "" : "s"}`;
 }
 
 function persistSeenJobs(seen: Set<string>) {
@@ -74,7 +83,7 @@ function persistSeenJobs(seen: Set<string>) {
 
 export function NotificationProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [jobsByChannel, setJobsByChannel] = useState<Record<string, RebuildJob>>({});
+  const [jobsBySource, setJobsBySource] = useState<Record<string, RebuildJob>>({});
   const [jobsCompleted, setJobsCompleted] = useState(0);
   const [notifications, setNotifications] = useState<Notification[]>(loadNotifications);
   // Tracks which rebuild jobs have already produced a notification, kept
@@ -130,7 +139,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     async function poll() {
       try {
-        const res = await api.channels.rebuildJobs();
+        const res = await api.jobs.list();
         if (cancelled) return;
         let finished = 0;
         const live = new Set(res.jobs.map((j) => j.id));
@@ -144,9 +153,9 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
             id,
             kind: "error",
             title: `${verb(prev)} interrupted`,
-            message: `"${prev.channelName}" stopped before finishing — the server restarted. Try again.`,
+            message: `"${prev.sourceName}" stopped before finishing — the server restarted. Try again.`,
           });
-          pushToast(`${verb(prev)} interrupted for "${prev.channelName}"`, "error");
+          pushToast(`${verb(prev)} interrupted for "${prev.sourceName}"`, "error");
         }
         for (const job of res.jobs) {
           if (job.status === "running") {
@@ -161,20 +170,20 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
               id: job.id,
               kind: "success",
               title: `${verb(job)} complete`,
-              message: `"${job.channelName}" finished with ${job.scanned.toLocaleString()} file(s).`,
+              message: `"${job.sourceName}" finished with ${counted(job)}.`,
             });
-            pushToast(`${verb(job)} complete for "${job.channelName}"`, "success");
+            pushToast(`${verb(job)} complete for "${job.sourceName}"`, "success");
           } else {
             addNotification({
               id: job.id,
               kind: "error",
               title: `${verb(job)} failed`,
-              message: `"${job.channelName}": ${job.error || "unknown error"}`,
+              message: `"${job.sourceName}": ${job.error || "unknown error"}`,
             });
-            pushToast(`${verb(job)} failed for "${job.channelName}"`, "error");
+            pushToast(`${verb(job)} failed for "${job.sourceName}"`, "error");
           }
         }
-        setJobsByChannel(Object.fromEntries([...runningJobs.current.values()].map((j) => [j.channelId, j])));
+        setJobsBySource(Object.fromEntries([...runningJobs.current.values()].map((j) => [j.sourceId, j])));
         if (finished) setJobsCompleted((n) => n + finished);
       } catch {
         // transient network hiccup — next tick retries
@@ -198,7 +207,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
         dismissToast,
         notifications,
         unreadCount,
-        jobsByChannel,
+        jobsBySource,
         jobsCompleted,
         markAllRead,
         dismissNotification,

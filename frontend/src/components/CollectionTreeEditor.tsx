@@ -9,29 +9,43 @@ import {
   Link2Off,
 } from "lucide-react";
 import Tooltip from "./Tooltip";
-import type { Channel, Collection } from "../types";
+import type { Collection, Source, SourceType } from "../types";
 import { api, ApiError } from "../api";
 
 const ICON_OPTIONS = ["folder", "newspaper", "book", "film", "music", "archive", "channel"];
 
-function flatten(nodes: Collection[], excludeId?: string, trail = ""): { id: string; label: string }[] {
+const SOURCE_NOUN: Record<SourceType, string> = {
+  telegram: "channel",
+  m3u: "playlist",
+};
+
+/** Candidate parents for a move: containers only (a source-bound leaf can't
+ *  hold children), and only within the same integration — the server rejects
+ *  a cross-sourceType move, so offering one would just produce an error. */
+function flatten(
+  nodes: Collection[],
+  excludeId: string | undefined,
+  sourceType: SourceType,
+  trail = ""
+): { id: string; label: string }[] {
   let out: { id: string; label: string }[] = [];
   for (const n of nodes) {
     if (n.id === excludeId) continue; // skip the subtree being moved/edited entirely below
+    if (n.sourceType !== sourceType) continue;
     const label = trail ? `${trail} / ${n.name}` : n.name;
-    if (!n.channelIds.length) out.push({ id: n.id, label });
-    out = out.concat(flatten(n.children, excludeId, label));
+    if (!n.sourceIds.length) out.push({ id: n.id, label });
+    out = out.concat(flatten(n.children, excludeId, sourceType, label));
   }
   return out;
 }
 
-function ChannelCheckboxList({
-  channels,
+function SourceCheckboxList({
+  sources,
   selected,
   onChange,
   disabled,
 }: {
-  channels: Channel[];
+  sources: Source[];
   selected: string[];
   onChange: (ids: string[]) => void;
   disabled?: boolean;
@@ -41,8 +55,8 @@ function ChannelCheckboxList({
   }
   return (
     <div className="flex flex-col gap-1 max-h-40 overflow-y-auto rounded-md border border-panda-border bg-panda-surface p-2">
-      {channels.length === 0 && <p className="text-xs text-panda-muted">No channels configured yet.</p>}
-      {channels.map((c) => (
+      {sources.length === 0 && <p className="text-xs text-panda-muted">Nothing to bind to yet.</p>}
+      {sources.map((c) => (
         <label key={c.id} className={`flex items-center gap-2 text-xs px-1 py-0.5 rounded ${disabled ? "opacity-50" : "hover:bg-panda-surface2"}`}>
           <input
             type="checkbox"
@@ -60,16 +74,16 @@ function ChannelCheckboxList({
 interface Props {
   nodes: Collection[];
   allNodes: Collection[];
-  channels: Channel[];
+  sources: Source[];
   onChange: () => void;
   depth?: number;
 }
 
-export default function CollectionTreeEditor({ nodes, allNodes, channels, onChange, depth = 0 }: Props) {
+export default function CollectionTreeEditor({ nodes, allNodes, sources, onChange, depth = 0 }: Props) {
   return (
     <div className="flex flex-col gap-1.5">
       {nodes.map((n) => (
-        <CollectionNode key={n.id} node={n} allNodes={allNodes} channels={channels} onChange={onChange} depth={depth} />
+        <CollectionNode key={n.id} node={n} allNodes={allNodes} sources={sources} onChange={onChange} depth={depth} />
       ))}
     </div>
   );
@@ -78,13 +92,13 @@ export default function CollectionTreeEditor({ nodes, allNodes, channels, onChan
 function CollectionNode({
   node,
   allNodes,
-  channels,
+  sources,
   onChange,
   depth,
 }: {
   node: Collection;
   allNodes: Collection[];
-  channels: Channel[];
+  sources: Source[];
   onChange: () => void;
   depth: number;
 }) {
@@ -94,8 +108,8 @@ function CollectionNode({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const boundChannels = channels.filter((c) => node.channelIds.includes(c.id));
-  const moveTargets = flatten(allNodes, node.id);
+  const boundSources = sources.filter((c) => node.sourceIds.includes(c.id));
+  const moveTargets = flatten(allNodes, node.id, node.sourceType);
 
   async function handleDelete() {
     if (!confirm(`Delete "${node.name}"? ${node.children.length ? "This also deletes its sub-collections." : ""}`)) return;
@@ -140,12 +154,12 @@ function CollectionNode({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium truncate">{node.name}</span>
-            {node.channelIds.length > 0 ? (
+            {node.sourceIds.length > 0 ? (
               <span className="flex items-center gap-1 text-xs text-panda-accent2">
                 <Link2 size={12} />
-                {boundChannels.length === node.channelIds.length
-                  ? boundChannels.map((c) => c.name).join(", ")
-                  : `${boundChannels.length} of ${node.channelIds.length} channels (some missing)`}
+                {boundSources.length === node.sourceIds.length
+                  ? boundSources.map((c) => c.name).join(", ")
+                  : `${boundSources.length} of ${node.sourceIds.length} sources (some missing)`}
               </span>
             ) : (
               <span className="text-xs text-panda-muted">{node.children.length} sub-collection{node.children.length === 1 ? "" : "s"}</span>
@@ -170,7 +184,7 @@ function CollectionNode({
           ))}
         </select>
 
-        {!node.channelIds.length && (
+        {!node.sourceIds.length && (
           <Tooltip label="Add sub-collection">
             <button
               onClick={() => setAddingChild((v) => !v)}
@@ -198,7 +212,7 @@ function CollectionNode({
         <div style={{ marginLeft: depth * 20 + 20 }}>
           <CollectionEditForm
             node={node}
-            channels={channels}
+            sources={sources}
             onDone={() => {
               setEditing(false);
               onChange();
@@ -212,7 +226,8 @@ function CollectionNode({
         <div style={{ marginLeft: depth * 20 + 20 }}>
           <CollectionCreateForm
             parentId={node.id}
-            channels={channels}
+            sourceType={node.sourceType}
+            sources={sources}
             onDone={() => {
               setAddingChild(false);
               onChange();
@@ -224,7 +239,7 @@ function CollectionNode({
 
       {expanded && node.children.length > 0 && (
         <div className="mt-1.5">
-          <CollectionTreeEditor nodes={node.children} allNodes={allNodes} channels={channels} onChange={onChange} depth={depth + 1} />
+          <CollectionTreeEditor nodes={node.children} allNodes={allNodes} sources={sources} onChange={onChange} depth={depth + 1} />
         </div>
       )}
     </div>
@@ -233,19 +248,19 @@ function CollectionNode({
 
 function CollectionEditForm({
   node,
-  channels,
+  sources,
   onDone,
   onCancel,
 }: {
   node: Collection;
-  channels: Channel[];
+  sources: Source[];
   onDone: () => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState(node.name);
   const [description, setDescription] = useState(node.description);
   const [icon, setIcon] = useState(node.icon || "folder");
-  const [channelIds, setChannelIds] = useState<string[]>(node.channelIds);
+  const [sourceIds, setSourceIds] = useState<string[]>(node.sourceIds);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -254,7 +269,7 @@ function CollectionEditForm({
     setBusy(true);
     setError(null);
     try {
-      await api.collections.update(node.id, { name, description, icon, channelIds });
+      await api.collections.update(node.id, { name, description, icon, sourceIds });
       onDone();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Update failed");
@@ -278,10 +293,10 @@ function CollectionEditForm({
       </div>
       <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Description" className="bg-panda-surface border border-panda-border rounded-md px-2 py-1.5 outline-none focus:border-panda-accent" />
       <label className="flex items-center gap-2 text-xs text-panda-muted">
-        {channelIds.length > 0 ? <Link2 size={12} /> : <Link2Off size={12} />}
-        <span>Bind to channel(s) (none selected = container collection):</span>
+        {sourceIds.length > 0 ? <Link2 size={12} /> : <Link2Off size={12} />}
+        <span>Bind to {SOURCE_NOUN[node.sourceType]}(s) (none selected = container collection):</span>
       </label>
-      <ChannelCheckboxList channels={channels} selected={channelIds} onChange={setChannelIds} disabled={node.children.length > 0} />
+      <SourceCheckboxList sources={sources} selected={sourceIds} onChange={setSourceIds} disabled={node.children.length > 0} />
       {node.children.length > 0 && <p className="text-xs text-panda-muted">Has sub-collections — can't bind channels until they're removed.</p>}
       <div className="flex justify-end gap-2 pt-1">
         <button type="button" onClick={onCancel} className="px-3 py-1 rounded-md border border-panda-border hover:border-panda-muted">
@@ -297,19 +312,23 @@ function CollectionEditForm({
 
 function CollectionCreateForm({
   parentId,
-  channels,
+  sources,
   onDone,
   onCancel,
+  sourceType = "telegram",
 }: {
   parentId: string | null;
-  channels: Channel[];
+  sources: Source[];
   onDone: () => void;
   onCancel: () => void;
+  /** Only consulted at the root — a sub-collection inherits its parent's
+   *  type and the server rejects any attempt to say otherwise. */
+  sourceType?: SourceType;
 }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [icon, setIcon] = useState("folder");
-  const [channelIds, setChannelIds] = useState<string[]>([]);
+  const [sourceIds, setSourceIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -323,8 +342,9 @@ function CollectionCreateForm({
         name: name.trim(),
         description: description.trim(),
         icon,
-        channelIds,
+        sourceIds,
         parentId,
+        sourceType: parentId === null ? sourceType : undefined,
       });
       onDone();
     } catch (e) {
@@ -347,8 +367,8 @@ function CollectionCreateForm({
           ))}
         </select>
       </div>
-      <label className="text-xs text-panda-muted">Bind to channel(s) (none selected = container collection):</label>
-      <ChannelCheckboxList channels={channels} selected={channelIds} onChange={setChannelIds} />
+      <label className="text-xs text-panda-muted">Bind to {SOURCE_NOUN[sourceType]}(s) (none selected = container collection):</label>
+      <SourceCheckboxList sources={sources} selected={sourceIds} onChange={setSourceIds} />
       <div className="flex justify-end gap-2 pt-1">
         <button type="button" onClick={onCancel} className="px-3 py-1 rounded-md border border-panda-border hover:border-panda-muted">
           Cancel
