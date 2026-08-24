@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Pencil, Plus, RefreshCw, RotateCw, Trash2 } from "lucide-react";
+import { Activity, Download, ExternalLink, Pencil, Plus, RefreshCw, RotateCw, Trash2 } from "lucide-react";
 import { api, ApiError } from "../../api";
 import type { Playlist } from "../../types";
 import ChannelCollections from "../ChannelCollections";
@@ -39,9 +39,18 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
 
   async function create(values: PlaylistFormValues) {
     try {
-      await api.playlists.create(values);
+      if (values.file) {
+        await api.playlists.createFromUpload({
+          name: values.name,
+          description: values.description,
+          allowedExtensions: values.allowedExtensions,
+          file: values.file,
+        });
+      } else {
+        await api.playlists.create(values);
+      }
       setAdding(false);
-      pushToast(`Fetching "${values.name}" — you'll get notified when it's scanned.`, "info");
+      pushToast(`Parsing "${values.name}" — you'll get notified when it's scanned.`, "info");
       load();
       onChanged();
     } catch (e) {
@@ -49,9 +58,18 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
     }
   }
 
-  async function update(id: string, values: PlaylistFormValues) {
+  async function update(p: Playlist, values: PlaylistFormValues) {
     try {
-      await api.playlists.update(id, values);
+      await api.playlists.update(p.id, {
+        name: values.name,
+        description: values.description,
+        ...(p.source === "upload" ? {} : { url: values.url, refreshMinutes: values.refreshMinutes }),
+        allowedExtensions: values.allowedExtensions,
+      });
+      if (values.file) {
+        await api.playlists.replaceUpload(p.id, values.file);
+        pushToast(`Replacing "${values.name}"'s file — you'll get notified when it's done.`, "info");
+      }
       setEditing(null);
       load();
     } catch (e) {
@@ -105,10 +123,20 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
     }
   }
 
+  async function checkStreams(p: Playlist) {
+    try {
+      await api.playlists.checkStreams(p.id);
+      pushToast(`Checking streams for "${p.name}" — you'll get notified when it's done.`, "info");
+    } catch (e) {
+      pushToast(e instanceof ApiError ? e.message : "Failed to start the check", "error");
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-panda-muted">
-        Nothing to connect — add a playlist URL below and its channels are fetched straight away.
+        Nothing to connect — add a playlist by URL or upload an .m3u file below, and its channels
+        are indexed straight away.
       </p>
 
       <div className="flex justify-between items-center gap-3 flex-wrap">
@@ -131,7 +159,7 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
       {playlists && playlists.length === 0 && !adding && (
         <EmptyState
           title="No playlists yet"
-          hint="Paste an M3U playlist URL — it's fetched and indexed straight away, no account needed."
+          hint="Paste an M3U playlist URL, or upload a file — either way it's indexed straight away, no account needed."
         />
       )}
 
@@ -141,7 +169,7 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
             <PlaylistForm
               key={p.id}
               initial={p}
-              onSubmit={(values) => update(p.id, values)}
+              onSubmit={(values) => update(p, values)}
               onCancel={() => setEditing(null)}
             />
           ) : (
@@ -155,7 +183,9 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
                   <FileCount count={p.fileCount} />
                   <StatusBadge status={p.status} job={jobsBySource[p.id]} sourceType="m3u" />
                 </div>
-                <p className="text-xs text-panda-muted font-mono truncate">{p.url}</p>
+                <p className="text-xs text-panda-muted font-mono truncate">
+                  {p.source === "upload" ? `Uploaded file — ${p.originalFilename ?? "no periodic re-fetch"}` : p.url}
+                </p>
                 {p.description && <p className="text-xs text-panda-muted mt-0.5">{p.description}</p>}
                 <PlaylistHealthNote
                   playlist={p}
@@ -164,38 +194,69 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
                   onReplaceAnyway={() => rescan(p, true)}
                 />
                 {sourceCollections && <ChannelCollections collections={sourceCollections[p.id] ?? []} />}
-                {jobsBySource[p.id] && <ScanProgress job={jobsBySource[p.id]} />}
+                {jobsBySource[p.id] &&
+                  (jobsBySource[p.id].status === "queued" ? (
+                    <p className="mt-1.5 text-[11px] text-panda-muted">Queued — waiting for the current check to finish</p>
+                  ) : (
+                    <ScanProgress
+                      job={jobsBySource[p.id]}
+                      unit={jobsBySource[p.id].kind === "health" ? "streams" : "files"}
+                    />
+                  ))}
               </div>
               <div className="flex items-center gap-1 shrink-0">
-                <Tooltip label={jobsBySource[p.id] ? "Re-fetch already running" : "Re-fetch this playlist now"}>
+                <Tooltip
+                  label={
+                    jobsBySource[p.id]?.kind === "health"
+                      ? jobsBySource[p.id].status === "queued"
+                        ? "Stream check queued"
+                        : "Checking streams now"
+                      : "Check this playlist's streams now"
+                  }
+                >
                   <button
-                    onClick={() => rescan(p)}
-                    disabled={busyId === p.id || !!jobsBySource[p.id]}
+                    onClick={() => checkStreams(p)}
+                    disabled={!!jobsBySource[p.id]}
                     className="flex items-center gap-1 p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2 disabled:opacity-50"
                   >
-                    {busyId === p.id || jobsBySource[p.id] ? (
-                      <RefreshCw size={16} className="animate-spin" />
-                    ) : (
-                      <RotateCw size={16} />
-                    )}
+                    <Activity size={16} className={jobsBySource[p.id]?.kind === "health" ? "animate-pulse" : ""} />
                   </button>
                 </Tooltip>
-                <CopyLinkButton
-                  url={p.url}
-                  label="Copy playlist URL"
-                  size={16}
-                  className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
-                />
-                <Tooltip label="Open the playlist file">
-                  <a
-                    href={p.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
-                  >
-                    <ExternalLink size={16} />
-                  </a>
-                </Tooltip>
+                {p.source === "url" && (
+                  <Tooltip label={jobsBySource[p.id] ? "Re-fetch already running" : "Re-fetch this playlist now"}>
+                    <button
+                      onClick={() => rescan(p)}
+                      disabled={busyId === p.id || !!jobsBySource[p.id]}
+                      className="flex items-center gap-1 p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2 disabled:opacity-50"
+                    >
+                      {busyId === p.id || jobsBySource[p.id] ? (
+                        <RefreshCw size={16} className="animate-spin" />
+                      ) : (
+                        <RotateCw size={16} />
+                      )}
+                    </button>
+                  </Tooltip>
+                )}
+                {p.source === "url" && (
+                  <>
+                    <CopyLinkButton
+                      url={p.url}
+                      label="Copy playlist URL"
+                      size={16}
+                      className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                    />
+                    <Tooltip label="Open the playlist file">
+                      <a
+                        href={p.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                      >
+                        <ExternalLink size={16} />
+                      </a>
+                    </Tooltip>
+                  </>
+                )}
                 <Tooltip label="Edit playlist">
                   <button
                     onClick={() => setEditing(p)}
@@ -203,6 +264,15 @@ export default function M3uPanel({ sourceCollections, onChanged }: IntegrationPa
                   >
                     <Pencil size={16} />
                   </button>
+                </Tooltip>
+                <Tooltip label="Download m3u file">
+                  <a
+                    href={`/api/playlists/${p.id}/download`}
+                    download
+                    className="p-1.5 rounded-md text-panda-muted hover:text-panda-accent hover:bg-panda-surface2"
+                  >
+                    <Download size={16} />
+                  </a>
                 </Tooltip>
                 <Tooltip label="Delete playlist">
                   <button

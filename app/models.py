@@ -75,11 +75,19 @@ class Playlist(BaseModel):
     id: str = Field(default_factory=new_id)
     name: str
     description: str = ""
-    url: str  # remote .m3u / .m3u8, exactly as entered
+    # How this playlist's entries were sourced. "upload" means `url` is empty
+    # and the raw file lives in config/uploads/<id>.m3u — there is no remote
+    # copy to periodically re-fetch, only a replacement upload.
+    source: Literal["url", "upload"] = "url"
+    url: str = ""  # remote .m3u / .m3u8, exactly as entered. Empty when source == "upload".
+    # The uploaded file's original name, kept only for display. Set only
+    # when source == "upload".
+    originalFilename: Optional[str] = None
     allowedExtensions: List[str] = Field(default_factory=list)  # matched against the stream URL's extension
     # How often to re-fetch. None means the M3U_REFRESH_MINUTES default,
     # rather than a copy of it, so raising the default lifts every playlist
-    # that never had an opinion.
+    # that never had an opinion. Meaningless for an uploaded playlist — the
+    # refresh scheduler skips those outright.
     refreshMinutes: Optional[int] = None
     created_at: float = Field(default_factory=time.time)
 

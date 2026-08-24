@@ -33,7 +33,7 @@ function count(n?: number): string {
 
 export default function CollectionView() {
   const { collectionId = "" } = useParams();
-  const { jobsBySource, jobsCompleted, healthJob } = useNotifications();
+  const { jobsBySource, jobsCompleted, healthJobs } = useNotifications();
   const { byId } = useIntegrations();
   const [tree, setTree] = useState<Collection[] | null>(null);
   const [docs, setDocs] = useState<DocumentOut[] | null>(null);
@@ -174,7 +174,7 @@ export default function CollectionView() {
   // page every few seconds. The dots on the rows themselves catch up when
   // the check finishes, which bumps jobsCompleted and reloads properly.
   useEffect(() => {
-    if (!healthJob || !isM3u || !node?.sourceIds.length) return;
+    if (!healthJobs.length || !isM3u || !node?.sourceIds.length) return;
     let cancelled = false;
     async function tick() {
       try {
@@ -190,7 +190,7 @@ export default function CollectionView() {
       cancelled = true;
       clearInterval(t);
     };
-  }, [healthJob, isM3u, collectionId, node?.sourceIds.length]);
+  }, [healthJobs.length, isM3u, collectionId, node?.sourceIds.length]);
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -405,7 +405,7 @@ export default function CollectionView() {
                 {!isM3u && <option value="size_asc">Smallest first</option>}
               </select>
             )}
-            {isM3u && healthJob && (
+            {isM3u && healthJobs.length > 0 && (
               <span className="text-xs text-panda-muted self-center">
                 Checking streams… counts update live
               </span>

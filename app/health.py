@@ -44,8 +44,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import cache
+from . import cache, jobs
 from .m3u import USER_AGENT
+from .models import M3U, Playlist
 
 log = logging.getLogger("panda_vault.health")
 
@@ -108,8 +109,13 @@ _KEY_LAST_SWEEP = "stream_health_last_sweep"
 # playlist syncs also use — a sweep would otherwise occupy every worker for
 # an hour and stall ordinary browsing.
 _pool: Optional[ThreadPoolExecutor] = None
-_lock = asyncio.Lock()
 _running = False
+
+# Playlists waiting for the worker loop, each {"playlist": Playlist, "jobId": str}.
+# A plain list, not a set: order is the whole point (FIFO), and coalescing
+# duplicates happens in enqueue() via the job list, not here.
+_queue: List[dict] = []
+_worker_task: Optional[asyncio.Task] = None
 
 
 @dataclass
@@ -135,7 +141,9 @@ def _get_pool() -> ThreadPoolExecutor:
 
 
 def shutdown() -> None:
-    global _pool
+    global _pool, _worker_task
+    if _worker_task is not None:
+        _worker_task.cancel()
     if _pool is not None:
         _pool.shutdown(wait=False, cancel_futures=True)
         _pool = None
@@ -290,23 +298,17 @@ def _group_by_host(
     return grouped
 
 
-async def sweep(
-    scope: Optional[Sequence[cache.SourceScope]] = None,
+async def _probe_scope(
+    scope: Sequence[cache.SourceScope],
     on_progress: Optional[Callable] = None,
     max_minutes: Optional[int] = None,
 ) -> dict:
-    """Probe every stream URL that is due, within the time budget.
+    """Probe every URL in scope that is due, within the time budget.
 
-    Returns a summary of what happened. `scope` limits it to one playlist's
-    entries; omitted, it covers everything in the cache.
+    Returns a summary of what happened. One call is one playlist's worth of
+    work — the worker loop below is what turns a request spanning several
+    playlists into a series of these.
     """
-    global _running
-
-    async with _lock:
-        if _running:
-            raise RuntimeError("A stream check is already running")
-        _running = True
-
     started = time.time()
     budget = (max_minutes if max_minutes is not None else MAX_MINUTES) * 60
     deadline = started + budget
@@ -317,171 +319,252 @@ async def sweep(
         "unknown": 0,
         "hostsSkipped": 0,
         "remaining": 0,
-        "pruned": 0,
         "elapsed": 0.0,
     }
 
-    try:
-        cutoff = time.time() - MIN_AGE_HOURS * 3600
-        candidates = await asyncio.to_thread(
-            cache.urls_needing_check, scope, cutoff, MAX_URLS
-        )
-        if not candidates:
-            log.info("Stream check: nothing due")
-            return summary
+    cutoff = time.time() - MIN_AGE_HOURS * 3600
+    candidates = await asyncio.to_thread(cache.urls_needing_check, scope, cutoff, MAX_URLS)
+    if not candidates:
+        log.info("Stream check: nothing due")
+        return summary
 
-        by_host = _group_by_host(candidates)
-        # Triage only pays for a host holding several URLs: one connect
-        # replaces several probes. On a host holding one URL it is pure
-        # overhead — a connect *plus* a probe where a probe alone would
-        # have done, and the probe learns the same thing. Real playlists
-        # are overwhelmingly the latter (three quarters of hosts here hold
-        # exactly one URL), so triage is applied selectively rather than to
-        # everything.
-        big = {k: v for k, v in by_host.items() if len(v) >= TRIAGE_MIN_URLS}
-        log.info(
-            "Stream check: %d URL(s) across %d host(s); triaging %d host(s) covering %d URL(s);"
-            " budget %d min",
-            len(candidates), len(by_host), len(big),
-            sum(len(v) for v in big.values()), budget // 60,
-        )
-        if on_progress:
-            on_progress(0, len(candidates))
+    by_host = _group_by_host(candidates)
+    # Triage only pays for a host holding several URLs: one connect
+    # replaces several probes. On a host holding one URL it is pure
+    # overhead — a connect *plus* a probe where a probe alone would
+    # have done, and the probe learns the same thing. Real playlists
+    # are overwhelmingly the latter (three quarters of hosts here hold
+    # exactly one URL), so triage is applied selectively rather than to
+    # everything.
+    big = {k: v for k, v in by_host.items() if len(v) >= TRIAGE_MIN_URLS}
+    log.info(
+        "Stream check: %d URL(s) across %d host(s); triaging %d host(s) covering %d URL(s);"
+        " budget %d min",
+        len(candidates), len(by_host), len(big),
+        sum(len(v) for v in big.values()), budget // 60,
+    )
+    if on_progress:
+        on_progress(0, len(candidates))
 
-        loop = asyncio.get_running_loop()
-        pool = _get_pool()
-        gate = asyncio.Semaphore(CONCURRENCY)
-        host_gates: Dict[Tuple[str, int], asyncio.Semaphore] = {}
-        writes: List[tuple] = []
-        done = 0
+    loop = asyncio.get_running_loop()
+    pool = _get_pool()
+    gate = asyncio.Semaphore(CONCURRENCY)
+    host_gates: Dict[Tuple[str, int], asyncio.Semaphore] = {}
+    writes: List[tuple] = []
+    done = 0
 
-        async def run(fn, *args):
-            async with gate:
-                return await loop.run_in_executor(pool, fn, *args)
+    async def run(fn, *args):
+        async with gate:
+            return await loop.run_in_executor(pool, fn, *args)
 
-        def note(rows: List[tuple]) -> None:
-            for row in rows:
-                summary[row[1]] = summary.get(row[1], 0) + 1
-            writes.extend(rows)
+    def note(rows: List[tuple]) -> None:
+        for row in rows:
+            summary[row[1]] = summary.get(row[1], 0) + 1
+        writes.extend(rows)
 
-        async def flush(force: bool = False) -> None:
-            nonlocal writes
-            if writes and (force or len(writes) >= _WRITE_BATCH):
-                batch, writes = writes, []
-                await asyncio.to_thread(cache.record_stream_health, batch)
+    async def flush(force: bool = False) -> None:
+        nonlocal writes
+        if writes and (force or len(writes) >= _WRITE_BATCH):
+            batch, writes = writes, []
+            await asyncio.to_thread(cache.record_stream_health, batch)
 
-        def progress() -> None:
-            if on_progress and done % 50 == 0:
-                on_progress(done, len(candidates))
+    def progress() -> None:
+        if on_progress and done % 50 == 0:
+            on_progress(done, len(candidates))
 
-        # ---- phase 1: settle the big hosts wholesale where we can --------
-        async def triage(key: Tuple[str, int]) -> Optional[List[tuple]]:
-            nonlocal done
-            host, port = key
-            if time.time() > deadline:
-                return None
-            alive, why = await run(host_reachable, host, port)
-            if alive:
-                return None
-            summary["hostsSkipped"] += 1
-            rows = []
-            for url, streak in by_host[key]:
-                status, new_streak = _verdict(
-                    Probe(url, cache.STREAM_UNAVAILABLE, error=why), streak
-                )
-                rows.append((url, status, None, None, new_streak, why))
-            done += len(rows)
-            progress()
-            return rows
-
-        settled: set = set()
-        if big:
-            # Concurrently, bounded by the same global gate as the probes —
-            # the previous version walked hosts one at a time, which on a
-            # long tail of small hosts left the gate almost entirely idle.
-            for key, rows in zip(big, await asyncio.gather(*(triage(k) for k in big))):
-                if rows is not None:
-                    settled.add(key)
-                    note(rows)
-            await flush()
-
-        # ---- phase 2: probe everything the triage didn't settle ----------
-        async def one(key: Tuple[str, int], url: str, streak: int) -> Optional[tuple]:
-            nonlocal done
-            if time.time() > deadline:
-                return None
-            host_gate = host_gates.setdefault(key, asyncio.Semaphore(PER_HOST))
-            # Per host first, then the global gate inside run(): a slot is
-            # only held while there is real work to do with it.
-            async with host_gate:
-                if time.time() > deadline:
-                    return None
-                result = await run(probe, url)
-            status, new_streak = _verdict(result, streak)
-            done += 1
-            progress()
-            return (url, status, result.http_code, result.latency_ms, new_streak, result.error)
-
-        pending = []
-        for key, urls in by_host.items():
-            if key in settled:
-                continue
-            host, _ = key
-            if not host:
-                note([(u, cache.STREAM_UNAVAILABLE, None, None, st + 1, "malformed URL") for u, st in urls])
-                done += len(urls)
-                continue
-            pending.extend((key, u, st) for u, st in urls)
-
-        # as_completed, not gather: gather resolves only once every probe has
-        # finished, so nothing reached the database until the whole sweep was
-        # over — an hour of work during which the UI could only say "0
-        # checked". Results now land as they arrive, and the counts climb
-        # while it runs, the same way a channel scan's do.
-        #
-        # Interleaved so consecutive URLs rarely share a host: the per-host
-        # cap then throttles almost nothing, while a provider still never
-        # sees more than PER_HOST at once.
-        tasks = [asyncio.create_task(one(k, u, st)) for k, u, st in pending]
-        try:
-            for finished in asyncio.as_completed(tasks):
-                row = await finished
-                if row is not None:
-                    note([row])
-                await flush()
-        except BaseException:
-            # A cancelled sweep must not leave 5,000 orphaned tasks probing
-            # away in the background.
-            for t in tasks:
-                t.cancel()
-            raise
-
-        await flush(force=True)
-
-        if done < len(candidates):
-            log.info(
-                "Stream check: budget reached, %d URL(s) left for next time",
-                len(candidates) - done,
+    # ---- phase 1: settle the big hosts wholesale where we can --------
+    async def triage(key: Tuple[str, int]) -> Optional[List[tuple]]:
+        nonlocal done
+        host, port = key
+        if time.time() > deadline:
+            return None
+        alive, why = await run(host_reachable, host, port)
+        if alive:
+            return None
+        summary["hostsSkipped"] += 1
+        rows = []
+        for url, streak in by_host[key]:
+            status, new_streak = _verdict(
+                Probe(url, cache.STREAM_UNAVAILABLE, error=why), streak
             )
+            rows.append((url, status, None, None, new_streak, why))
+        done += len(rows)
+        progress()
+        return rows
 
-        summary["checked"] = done
-        summary["remaining"] = max(0, len(candidates) - done)
-        summary["pruned"] = await asyncio.to_thread(cache.prune_stream_health)
-        if on_progress:
-            on_progress(done, done)
-    finally:
-        _running = False
-        summary["elapsed"] = round(time.time() - started, 1)
-        # Stamped even on a partial sweep: the leftovers are already at the
-        # front of the next run's queue, and not stamping would make an
-        # interrupted night look overdue forever and re-run immediately.
-        cache.set_setting(_KEY_LAST_SWEEP, str(time.time()))
+    settled: set = set()
+    if big:
+        # Concurrently, bounded by the same global gate as the probes —
+        # the previous version walked hosts one at a time, which on a
+        # long tail of small hosts left the gate almost entirely idle.
+        for key, rows in zip(big, await asyncio.gather(*(triage(k) for k in big))):
+            if rows is not None:
+                settled.add(key)
+                note(rows)
+        await flush()
+
+    # ---- phase 2: probe everything the triage didn't settle ----------
+    async def one(key: Tuple[str, int], url: str, streak: int) -> Optional[tuple]:
+        nonlocal done
+        if time.time() > deadline:
+            return None
+        host_gate = host_gates.setdefault(key, asyncio.Semaphore(PER_HOST))
+        # Per host first, then the global gate inside run(): a slot is
+        # only held while there is real work to do with it.
+        async with host_gate:
+            if time.time() > deadline:
+                return None
+            result = await run(probe, url)
+        status, new_streak = _verdict(result, streak)
+        done += 1
+        progress()
+        return (url, status, result.http_code, result.latency_ms, new_streak, result.error)
+
+    pending = []
+    for key, urls in by_host.items():
+        if key in settled:
+            continue
+        host, _ = key
+        if not host:
+            note([(u, cache.STREAM_UNAVAILABLE, None, None, st + 1, "malformed URL") for u, st in urls])
+            done += len(urls)
+            continue
+        pending.extend((key, u, st) for u, st in urls)
+
+    # as_completed, not gather: gather resolves only once every probe has
+    # finished, so nothing reached the database until the whole sweep was
+    # over — an hour of work during which the UI could only say "0
+    # checked". Results now land as they arrive, and the counts climb
+    # while it runs, the same way a channel scan's do.
+    #
+    # Interleaved so consecutive URLs rarely share a host: the per-host
+    # cap then throttles almost nothing, while a provider still never
+    # sees more than PER_HOST at once.
+    tasks = [asyncio.create_task(one(k, u, st)) for k, u, st in pending]
+    try:
+        for finished in asyncio.as_completed(tasks):
+            row = await finished
+            if row is not None:
+                note([row])
+            await flush()
+    except BaseException:
+        # A cancelled probe must not leave orphaned tasks probing away in
+        # the background.
+        for t in tasks:
+            t.cancel()
+        raise
+
+    await flush(force=True)
+
+    if done < len(candidates):
+        log.info(
+            "Stream check: budget reached, %d URL(s) left for next time",
+            len(candidates) - done,
+        )
+
+    summary["checked"] = done
+    summary["remaining"] = max(0, len(candidates) - done)
+    summary["elapsed"] = round(time.time() - started, 1)
+    if on_progress:
+        on_progress(done, done)
 
     log.info(
         "Stream check finished: %d checked in %.0fs (%d host(s) skipped whole, %d left)",
         summary["checked"], summary["elapsed"], summary["hostsSkipped"], summary["remaining"],
     )
     return summary
+
+
+def enqueue(playlist: Playlist, silent: bool = False) -> str:
+    """Queue one playlist's streams to be checked. Returns the job id.
+
+    Coalesced: a playlist already queued or being checked gets its existing
+    job id back rather than a duplicate entry, so clicking "check" twice (or
+    an auto-trigger racing a manual one) doesn't double the work. A
+    non-silent request that coalesces onto an already-queued silent
+    (nightly) job un-silences it — the user's own click should still be
+    heard from, even though it didn't start a new job.
+
+    `silent` is for the nightly sweep: tracked here like any other check so
+    the playlist's row can show progress, but excluded from notifications.
+    """
+    existing = [
+        j for j in jobs.for_source(playlist.id)
+        if j["kind"] == jobs.HEALTH and j["status"] in ("queued", "running")
+    ]
+    if existing:
+        job_id = existing[0]["id"]
+        if not silent:
+            jobs.unsilence(job_id)
+        return job_id
+
+    job_id = jobs.record(playlist, jobs.HEALTH, M3U, status="queued", silent=silent)
+    _queue.append({"playlist": playlist, "jobId": job_id})
+    _ensure_worker()
+    return job_id
+
+
+async def enqueue_many(
+    playlists: Sequence[Playlist], skip_if_nothing_due: bool = False, silent: bool = False
+) -> List[str]:
+    """Queue several playlists at once.
+
+    `skip_if_nothing_due` leaves out a playlist with nothing outstanding —
+    "Scan remaining" and the nightly sweep both want that; "Scan all" wants
+    every playlist queued regardless.
+    """
+    cutoff = time.time() - MIN_AGE_HOURS * 3600
+    job_ids = []
+    for playlist in playlists:
+        if skip_if_nothing_due:
+            due = await asyncio.to_thread(
+                cache.count_urls_needing_check, [(playlist.id, playlist.allowedExtensions)], cutoff
+            )
+            if not due:
+                continue
+        job_ids.append(enqueue(playlist, silent=silent))
+    return job_ids
+
+
+def _ensure_worker() -> None:
+    global _worker_task
+    if _worker_task is None or _worker_task.done():
+        _worker_task = asyncio.create_task(_worker_loop())
+
+
+async def _worker_loop() -> None:
+    """Drain the queue one playlist at a time, picking up anything appended
+    while it runs. This is the single point of concurrency control — only
+    one playlist is ever probed at once, same as the old single sweep, so a
+    provider never sees more than one check's worth of traffic regardless of
+    how many playlists asked for one.
+    """
+    global _running
+    _running = True
+    try:
+        while _queue:
+            item = _queue.pop(0)
+            job_id = item["jobId"]
+            playlist = item["playlist"]
+            jobs.start(job_id)
+            scope = [(playlist.id, playlist.allowedExtensions)]
+            try:
+                summary = await _probe_scope(scope, on_progress=jobs.progress_cb(job_id))
+                log.info("Stream check for %s: %s", playlist.name, summary)
+                jobs.finish(job_id, "done")
+            except asyncio.CancelledError:
+                jobs.finish(job_id, "error", "Stream check was interrupted — the server restarted")
+                raise
+            except Exception as e:
+                log.warning("Stream check failed for playlist %s: %s", playlist.id, e)
+                jobs.finish(job_id, "error", str(e))
+        await asyncio.to_thread(cache.prune_stream_health)
+    finally:
+        _running = False
+        # Stamped whenever the queue empties, whatever triggered it: a
+        # manual check that just covered everything is as good a reason for
+        # tonight's sweep to skip as the sweep itself finishing would be.
+        cache.set_setting(_KEY_LAST_SWEEP, str(time.time()))
 
 
 def last_sweep_at() -> Optional[float]:

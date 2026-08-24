@@ -333,9 +333,9 @@ def _shrank(incoming: int, previous: int) -> bool:
 
 
 def _sync_blocking(
-    playlist_id: str, url: str, on_progress: Optional[Callable], allow_shrink: bool
+    playlist_id: str, fetch_text: Callable[[], str], on_progress: Optional[Callable], allow_shrink: bool
 ) -> int:
-    text = fetch(url)
+    text = fetch_text()
     _validate_body(text)
     docs = _to_documents(parse(text), on_progress)
 
@@ -353,6 +353,54 @@ def _sync_blocking(
     return cache.replace_source_documents(playlist_id, docs)
 
 
+async def _sync(
+    playlist_id: str,
+    fetch_text: Callable[[], str],
+    force_refresh: bool,
+    on_progress: Optional[Callable],
+    allow_shrink: bool,
+) -> int:
+    """Shared body of sync_playlist and sync_uploaded_playlist.
+
+    The only difference between a URL-sourced and an uploaded playlist is
+    how the raw text is obtained — `fetch_text` is either an HTTP GET or a
+    decode of bytes already on disk. Everything after that (locking, the
+    non-playlist-body guard, the shrink guard, the snapshot swap, health
+    recording) is identical, so both call through here rather than
+    duplicating it.
+    """
+    if not force_refresh and cache.has_source(playlist_id):
+        return cache.count_documents(playlist_id)
+
+    # Same double-checked locking as sync_channel: a background refresh and
+    # a user hitting Rescan must not both sync the same playlist.
+    async with _lock_for(playlist_id):
+        if not force_refresh and cache.has_source(playlist_id):
+            return cache.count_documents(playlist_id)
+        # Fetching (or decoding), parsing and the bulk insert are all
+        # blocking, and a large playlist is hundreds of thousands of lines —
+        # this would stall the event loop for everyone else.
+        try:
+            count = await asyncio.to_thread(
+                _sync_blocking, playlist_id, fetch_text, on_progress, allow_shrink
+            )
+        except PlaylistError as e:
+            streak = await asyncio.to_thread(cache.record_fetch, playlist_id, e.status, str(e))
+            log.warning("Playlist %s fetch %s (failure %d): %s", playlist_id, e.status, streak, e)
+            raise
+        except asyncio.CancelledError:
+            # A shutdown mid-sync says nothing about the source, so it must
+            # not count against the streak or the playlist would look broken
+            # after a few restarts.
+            raise
+        except Exception as e:
+            await asyncio.to_thread(cache.record_fetch, playlist_id, cache.FETCH_FAILED, str(e))
+            raise
+        await asyncio.to_thread(cache.record_fetch, playlist_id, cache.FETCH_OK)
+        log.info("Playlist %s synced: %d entr%s", playlist_id, count, "y" if count == 1 else "ies")
+        return count
+
+
 async def sync_playlist(
     playlist_id: str,
     url: str,
@@ -360,8 +408,8 @@ async def sync_playlist(
     on_progress: Optional[Callable] = None,
     allow_shrink: bool = False,
 ) -> int:
-    """Bring a playlist's cached entries up to date, returning how many it
-    holds afterwards.
+    """Bring a URL-sourced playlist's cached entries up to date, returning how
+    many it holds afterwards.
 
     Mirrors telegram_client.sync_channel's contract — a count, never the
     entries themselves, so the routers never hold more than the page they
@@ -378,33 +426,23 @@ async def sync_playlist(
     source's health, here rather than in the callers, so the scheduled
     refresh, a manual rescan and a collection open all leave the same trail.
     """
-    if not force_refresh and cache.has_source(playlist_id):
-        return cache.count_documents(playlist_id)
+    return await _sync(playlist_id, lambda: fetch(url), force_refresh, on_progress, allow_shrink)
 
-    # Same double-checked locking as sync_channel: a background refresh and
-    # a user hitting Rescan must not both fetch the same playlist.
-    async with _lock_for(playlist_id):
-        if not force_refresh and cache.has_source(playlist_id):
-            return cache.count_documents(playlist_id)
-        # Fetch, parse and the bulk insert are all blocking, and a large
-        # playlist is hundreds of thousands of lines — this would stall the
-        # event loop for everyone else.
-        try:
-            count = await asyncio.to_thread(
-                _sync_blocking, playlist_id, url, on_progress, allow_shrink
-            )
-        except PlaylistError as e:
-            streak = await asyncio.to_thread(cache.record_fetch, playlist_id, e.status, str(e))
-            log.warning("Playlist %s fetch %s (failure %d): %s", playlist_id, e.status, streak, e)
-            raise
-        except asyncio.CancelledError:
-            # A shutdown mid-fetch says nothing about the URL, so it must not
-            # count against the streak or the playlist would look broken
-            # after a few restarts.
-            raise
-        except Exception as e:
-            await asyncio.to_thread(cache.record_fetch, playlist_id, cache.FETCH_FAILED, str(e))
-            raise
-        await asyncio.to_thread(cache.record_fetch, playlist_id, cache.FETCH_OK)
-        log.info("Playlist %s synced: %d entr%s", playlist_id, count, "y" if count == 1 else "ies")
-        return count
+
+async def sync_uploaded_playlist(
+    playlist_id: str,
+    content: bytes,
+    force_refresh: bool = False,
+    on_progress: Optional[Callable] = None,
+    allow_shrink: bool = False,
+) -> int:
+    """The upload counterpart of sync_playlist.
+
+    There is no remote fetch — `content` is the bytes already saved to
+    config/uploads by the router — but everything downstream still applies:
+    the same non-playlist-body guard rejects a file that isn't actually an
+    M3U, the same shrink guard protects a replacement upload that lost most
+    of its entries, and the same health trail records the attempt.
+    """
+    text = content.decode("utf-8", errors="replace")
+    return await _sync(playlist_id, lambda: text, force_refresh, on_progress, allow_shrink)

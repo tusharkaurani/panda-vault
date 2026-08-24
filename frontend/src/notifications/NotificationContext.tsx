@@ -25,14 +25,14 @@ interface NotificationContextValue {
   dismissToast: (id: string) => void;
   notifications: Notification[];
   unreadCount: number;
-  // Live scan/rebuild jobs keyed by channel, plus a counter that ticks
+  // Live scan/rebuild/health jobs keyed by source, plus a counter that ticks
   // whenever one finishes — components use it as an effect dependency to
-  // refetch the counts a completed scan just changed.
+  // refetch the counts a completed job just changed.
   jobsBySource: Record<string, RebuildJob>;
-  /** The running stream check, if there is one. Deliberately separate from
-   *  jobsBySource: that map is keyed by source id and drives "this playlist
-   *  is busy", which a check spanning every playlist is not. */
-  healthJob?: RebuildJob;
+  /** Every stream check that's queued or running right now, across every
+   *  playlist — the vault-wide panel's summary reads this; a single
+   *  playlist's own progress reads jobsBySource[playlistId] instead. */
+  healthJobs: RebuildJob[];
   jobsCompleted: number;
   markAllRead: () => void;
   dismissNotification: (id: string) => void;
@@ -92,7 +92,7 @@ function persistSeenJobs(seen: Set<string>) {
 export function NotificationProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [jobsBySource, setJobsBySource] = useState<Record<string, RebuildJob>>({});
-  const [healthJob, setHealthJob] = useState<RebuildJob | undefined>(undefined);
+  const [healthJobs, setHealthJobs] = useState<RebuildJob[]>([]);
   const [jobsCompleted, setJobsCompleted] = useState(0);
   const [notifications, setNotifications] = useState<Notification[]>(loadNotifications);
   // Tracks which rebuild jobs have already produced a notification, kept
@@ -158,6 +158,10 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
           finished++;
           if (seenJobs.current.has(id)) continue;
           markSeen(id);
+          // Silent (nightly) jobs are tracked here like any other so a
+          // playlist's row can show progress, but never produce a
+          // notification-bell entry — routine housekeeping shouldn't page.
+          if (prev.silent) continue;
           addNotification({
             id,
             kind: "error",
@@ -167,13 +171,18 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
           pushToast(`${verb(prev)} interrupted for "${prev.sourceName}"`, "error");
         }
         for (const job of res.jobs) {
-          if (job.status === "running") {
+          // A queued stream check hasn't started yet, but tracking it the
+          // same way a running one is tracked is what lets its row show a
+          // "waiting" state, and what lets a restart before it ever starts
+          // still be reported as interrupted above.
+          if (job.status === "running" || job.status === "queued") {
             runningJobs.current.set(job.id, job);
             continue;
           }
           if (runningJobs.current.delete(job.id)) finished++;
           if (seenJobs.current.has(job.id)) continue;
           markSeen(job.id);
+          if (job.silent) continue;
           if (job.status === "done") {
             addNotification({
               id: job.id,
@@ -194,7 +203,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
         }
         const running = [...runningJobs.current.values()];
         setJobsBySource(Object.fromEntries(running.map((j) => [j.sourceId, j])));
-        setHealthJob(running.find((j) => j.kind === "health"));
+        setHealthJobs(running.filter((j) => j.kind === "health"));
         if (finished) setJobsCompleted((n) => n + finished);
       } catch {
         // transient network hiccup — next tick retries
@@ -219,7 +228,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
         notifications,
         unreadCount,
         jobsBySource,
-        healthJob,
+        healthJobs,
         jobsCompleted,
         markAllRead,
         dismissNotification,

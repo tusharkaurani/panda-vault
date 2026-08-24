@@ -8,13 +8,14 @@ join, no incremental scan, and "rescan" is the only sync there is.
 import asyncio
 import logging
 import time
-from typing import List, Set
-from urllib.parse import urlsplit
+from typing import Iterator, List, Literal, Set
+from urllib.parse import quote, urlsplit
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from .. import cache, health, jobs, m3u, sources, store
-from ..models import M3U, Playlist, PlaylistIn, PlaylistOut, PlaylistUpdate
+from ..models import DocumentOut, M3U, Playlist, PlaylistIn, PlaylistOut, PlaylistUpdate
 
 router = APIRouter(prefix="/api/playlists", tags=["playlists"])
 log = logging.getLogger("panda_vault.playlists")
@@ -44,6 +45,44 @@ def _validate_url(url: str) -> str:
     return url
 
 
+def _parse_extensions(raw: str) -> List[str]:
+    return [e.strip().lstrip(".").lower() for e in raw.split(",") if e.strip()]
+
+
+async def _read_upload(file: UploadFile) -> bytes:
+    """Reads an uploaded file, refusing anything past m3u's own size cap —
+    one byte over, so an oversized upload is detected rather than silently
+    truncated into a half-parsed playlist, same as a fetched one."""
+    content = await file.read(m3u.MAX_BYTES + 1)
+    if len(content) > m3u.MAX_BYTES:
+        raise HTTPException(400, f"Playlist file is larger than {m3u.MAX_BYTES // (1024 * 1024)}MB")
+    if not content.strip():
+        raise HTTPException(400, "The uploaded file is empty")
+    return content
+
+
+def _m3u_lines(entries: Iterator[DocumentOut]) -> Iterator[str]:
+    """Render cached entries back into M3U text.
+
+    This regenerates the file from what the vault has cached, rather than
+    re-serving the original URL — the source may since have expired, moved,
+    or started demanding headers only the provider's own fetch sends. It's
+    also why it comes out in playlist order (`sort="date_asc"`, see
+    cache.iter_documents) rather than whatever order the UI is sorted by.
+    """
+    yield "#EXTM3U\n"
+    for doc in entries:
+        if not doc.url:
+            continue
+        attrs = ""
+        if doc.group:
+            attrs += f' group-title="{doc.group}"'
+        if doc.logo:
+            attrs += f' tvg-logo="{doc.logo}"'
+        yield f"#EXTINF:-1{attrs},{doc.name}\n"
+        yield f"{doc.url}\n"
+
+
 async def _scan(job_id: str, playlist: Playlist, kind: str, allow_shrink: bool = False) -> None:
     """Fetch and parse a playlist in the background.
 
@@ -58,13 +97,26 @@ async def _scan(job_id: str, playlist: Playlist, kind: str, allow_shrink: bool =
     started = time.time()
     log.info("%s started for playlist %s (%s), job %s", kind.title(), playlist.name, playlist.id, job_id)
     try:
-        count = await m3u.sync_playlist(
-            playlist.id,
-            playlist.url,
-            force_refresh=True,
-            on_progress=jobs.progress_cb(job_id),
-            allow_shrink=allow_shrink,
-        )
+        if playlist.source == "upload":
+            # No remote copy to refetch — re-parse whatever was most
+            # recently saved to config/uploads, which is either the
+            # original upload or a replacement one just wrote there.
+            content = await asyncio.to_thread(store.load_uploaded_playlist, playlist.id)
+            count = await m3u.sync_uploaded_playlist(
+                playlist.id,
+                content,
+                force_refresh=True,
+                on_progress=jobs.progress_cb(job_id),
+                allow_shrink=allow_shrink,
+            )
+        else:
+            count = await m3u.sync_playlist(
+                playlist.id,
+                playlist.url,
+                force_refresh=True,
+                on_progress=jobs.progress_cb(job_id),
+                allow_shrink=allow_shrink,
+            )
     except asyncio.CancelledError:
         # Server shutting down (or the task was cancelled) mid-scan. Without
         # this the job would stay "running" forever, since CancelledError is
@@ -86,6 +138,12 @@ async def _scan(job_id: str, playlist: Playlist, kind: str, allow_shrink: bool =
         kind.title(), playlist.name, count, "y" if count == 1 else "ies", time.time() - started,
     )
     jobs.finish(job_id, "done")
+    if kind == "scan":
+        # A fresh scan (add, or a URL change) means every stream in it is
+        # unverified — check them now rather than waiting for the nightly
+        # sweep to get around to it. A routine rescan doesn't retrigger
+        # this, or every scheduled refresh would also queue a check.
+        health.enqueue(playlist)
 
 
 def _collections_using_playlist(collections, playlist_id: str):
@@ -136,6 +194,9 @@ async def stream_health_summary():
         "due": due,
         "estimatedMinutes": _estimate_minutes(due),
         "totals": totals,
+        "queued": len(
+            [j for j in jobs.all_jobs() if j["kind"] == jobs.HEALTH and j["status"] in ("queued", "running")]
+        ),
     }
 
 
@@ -189,44 +250,26 @@ def _profile(scope, cutoff) -> dict:
     }
 
 
-async def _run_sweep(job_id: str, scope, label: str) -> None:
-    try:
-        summary = await health.sweep(scope=scope, on_progress=jobs.progress_cb(job_id))
-    except asyncio.CancelledError:
-        jobs.finish(job_id, "error", "Stream check was interrupted — the server restarted")
-        raise
-    except Exception as e:
-        log.warning("Stream check failed for %s: %s", label, e)
-        jobs.finish(job_id, "error", str(e))
-        return
-    log.info("Stream check for %s: %s", label, summary)
-    jobs.finish(job_id, "done")
-
-
 @router.post("/health/scan", status_code=202)
-async def scan_all_streams():
-    """Check every playlist's streams now.
+async def scan_streams(mode: Literal["remaining", "all"] = "all"):
+    """Queue every playlist's streams to be checked.
 
-    Tracked as a job — unlike the nightly sweep, which stays silent — so the
-    notification bell reports it, and so the UI can show progress against a
-    total the user was warned about.
+    `remaining` only queues a playlist with something actually outstanding;
+    `all` (today's original "Check now") queues every playlist regardless.
+    Never rejects — a check already running just means these join the
+    queue behind it, each getting its own job the notification bell and the
+    playlist's own row can track.
     """
-    if health.is_running():
-        raise HTTPException(409, "A stream check is already running")
-    job_id = jobs.record(jobs.health_source(), jobs.HEALTH, M3U)
-    _spawn(_run_sweep(job_id, _all_playlist_scope(), "all playlists"))
-    return {"checking": True, "jobId": job_id}
+    job_ids = await health.enqueue_many(store.load_playlists(), skip_if_nothing_due=(mode == "remaining"))
+    return {"queued": True, "jobIds": job_ids}
 
 
 @router.post("/{playlist_id}/health/scan", status_code=202)
 async def scan_playlist_streams(playlist_id: str):
-    if health.is_running():
-        raise HTTPException(409, "A stream check is already running")
     for p in store.load_playlists():
         if p.id == playlist_id:
-            job_id = jobs.record(jobs.health_source(p.name), jobs.HEALTH, M3U)
-            _spawn(_run_sweep(job_id, sources.scope([p]), p.name))
-            return {"checking": True, "jobId": job_id}
+            job_id = health.enqueue(p)
+            return {"queued": True, "jobId": job_id}
     raise HTTPException(404, "Playlist not found")
 
 
@@ -240,12 +283,42 @@ def list_playlists():
     return [jobs.to_playlist_out(p, counts.get(p.id), health.get(p.id)) for p in playlists]
 
 
+@router.get("/{playlist_id}/download")
+def download_playlist(playlist_id: str):
+    """An .m3u file rebuilt from this playlist's cached entries.
+
+    Not a proxy to `playlist.url` — that's what the "Open the playlist
+    file" link already does, and it hands the browser the *provider's*
+    file (which may 404, redirect, or want a session it doesn't have).
+    This instead writes out what the vault last successfully synced.
+    """
+    playlist = next((p for p in store.load_playlists() if p.id == playlist_id), None)
+    if playlist is None:
+        raise HTTPException(404, "Playlist not found")
+
+    scope = sources.scope([playlist])
+    safe_name = "".join(c for c in playlist.name if c.isalnum() or c in " ._-").strip() or "playlist"
+    filename_ascii = safe_name.encode("ascii", "ignore").decode("ascii") or "playlist"
+    headers = {
+        "Content-Disposition": (
+            f'attachment; filename="{filename_ascii}.m3u"; '
+            f"filename*=UTF-8''{quote(safe_name)}.m3u"
+        )
+    }
+    return StreamingResponse(
+        _m3u_lines(cache.iter_documents(scope)),
+        media_type="application/vnd.apple.mpegurl",
+        headers=headers,
+    )
+
+
 @router.post("", response_model=Playlist, status_code=201)
 async def create_playlist(body: PlaylistIn):
     playlists = store.load_playlists()
     playlist = Playlist(
         name=body.name,
         description=body.description,
+        source="url",
         url=_validate_url(body.url),
         allowedExtensions=body.allowedExtensions,
         refreshMinutes=body.refreshMinutes,
@@ -258,12 +331,72 @@ async def create_playlist(body: PlaylistIn):
     return playlist
 
 
+@router.post("/upload", response_model=Playlist, status_code=201)
+async def create_playlist_upload(
+    name: str = Form(...),
+    description: str = Form(""),
+    allowedExtensions: str = Form(""),
+    file: UploadFile = File(...),
+):
+    """The upload counterpart of create_playlist. A multipart form rather
+    than the JSON body every other endpoint here takes, because it's the
+    only one carrying a file — everything else stays consistent with the
+    URL flow, including the immediate background scan.
+    """
+    content = await _read_upload(file)
+    playlist = Playlist(
+        name=name,
+        description=description,
+        source="upload",
+        originalFilename=file.filename,
+        allowedExtensions=_parse_extensions(allowedExtensions),
+    )
+    await asyncio.to_thread(store.save_uploaded_playlist, playlist.id, content)
+    playlists = store.load_playlists()
+    playlists.append(playlist)
+    store.save_playlists(playlists)
+    _spawn(_scan(jobs.record(playlist, jobs.SCAN, M3U), playlist, "scan"))
+    return playlist
+
+
+@router.post("/{playlist_id}/upload", status_code=202)
+async def replace_playlist_upload(playlist_id: str, force: bool = False, file: UploadFile = File(...)):
+    """Replaces an uploaded playlist's file and re-syncs from it — the
+    upload counterpart of rescan_playlist, since there's no URL to refetch.
+
+    `force` carries the same meaning as rescan's: the user has seen the
+    shrink guard's numbers and decided the collapse is real. Only valid for
+    a playlist that was itself added by upload; a URL-sourced one is
+    refreshed by editing its URL, not by uploading a file.
+    """
+    for p in store.load_playlists():
+        if p.id != playlist_id:
+            continue
+        if p.source != "upload":
+            raise HTTPException(400, "This playlist is fetched from a URL — edit the URL instead of uploading a file.")
+        content = await _read_upload(file)
+        await asyncio.to_thread(store.save_uploaded_playlist, playlist_id, content)
+        if file.filename and file.filename != p.originalFilename:
+            playlists = store.load_playlists()
+            for i, pp in enumerate(playlists):
+                if pp.id == playlist_id:
+                    playlists[i] = pp.model_copy(update={"originalFilename": file.filename})
+                    break
+            store.save_playlists(playlists)
+        job_id = jobs.record(p, jobs.REBUILD, M3U)
+        _spawn(_scan(job_id, p, "rescan", allow_shrink=force))
+        return {"rebuilding": True, "jobId": job_id}
+    raise HTTPException(404, "Playlist not found")
+
+
 @router.put("/{playlist_id}", response_model=Playlist)
 async def update_playlist(playlist_id: str, body: PlaylistUpdate):
     playlists = store.load_playlists()
     for i, p in enumerate(playlists):
         if p.id != playlist_id:
             continue
+        if body.url is not None and p.source == "upload":
+            raise HTTPException(400, "This playlist was added by upload — replace its file instead of setting a URL.")
         data = p.model_dump()
         data.update(body.model_dump(exclude_unset=True))
         if body.url is not None:
@@ -308,6 +441,7 @@ def delete_playlist(playlist_id: str, force: bool = False):
 
     store.save_playlists([p for p in playlists if p.id != playlist_id])
     cache.invalidate(playlist_id)
+    store.delete_uploaded_playlist(playlist_id)
     return None
 
 

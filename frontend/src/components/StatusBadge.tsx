@@ -56,9 +56,16 @@ const HINTS: Record<SourceType, Record<SourceStatus, string>> = {
 
 /** A running job wins over the channel's stored status: the poll that
  *  carries it refreshes every few seconds, while the channel list is only
- *  refetched on navigation and would otherwise show a stale "Ready". */
+ *  refetched on navigation and would otherwise show a stale "Ready".
+ *
+ *  A `health` job is excluded: checking a playlist's streams isn't a scan
+ *  of the playlist itself, and jobsBySource now carries per-playlist health
+ *  jobs the same way it carries scan/rebuild ones — without this exclusion
+ *  a running stream check would flip the pill to "Scanning". */
 export function effectiveStatus(status: SourceStatus, job?: RebuildJob): SourceStatus {
-  if (job?.status === "running") return job.kind === "rebuild" ? "rebuilding" : "scanning";
+  if (job?.status === "running" && job.kind !== "health") {
+    return job.kind === "rebuild" ? "rebuilding" : "scanning";
+  }
   return status;
 }
 
@@ -74,7 +81,7 @@ export default function StatusBadge({
   const resolved = effectiveStatus(status, job);
   const style = STYLES[resolved] ?? STYLES.unscanned;
   const unit = sourceType === "m3u" ? "channel" : "file";
-  const live = job?.status === "running" ? job : undefined;
+  const live = job?.status === "running" && job.kind !== "health" ? job : undefined;
   const baseLabel = resolved === "empty" && sourceType === "m3u" ? "No channels" : style.label;
   const label = live
     ? `${baseLabel} ${live.scanned.toLocaleString()}${live.total ? ` / ${live.total.toLocaleString()}` : ""}`

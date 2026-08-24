@@ -104,6 +104,10 @@ def _due_playlists(now: float) -> List[Playlist]:
 
     due = []
     for playlist in playlists:
+        if playlist.source == "upload":
+            # Nothing to re-fetch — an uploaded playlist only changes when
+            # the user uploads a replacement.
+            continue
         health = health_by_id.get(playlist.id)
         last = _last_attempt(playlist.id, health)
         if last is None:
@@ -163,14 +167,15 @@ async def _sweep_streams(now: float) -> None:
     probing yesterday's snapshot would report the stale token as a dead
     channel. Checking the freshly-fetched URLs measures the stream.
 
-    Like the refresh itself it is deliberately untracked in jobs.py — a
-    notification every night for routine housekeeping is a notification
-    nobody reads. A user-triggered check does get a job.
+    Queued through the same per-playlist jobs a manual check uses — so a
+    playlist's row shows progress if someone happens to be looking — but
+    `silent=True` keeps it out of the notification bell, same as before:
+    routine housekeeping shouldn't fire a toast per playlist every night.
     """
     if not health.is_due(now, _in_nightly_window(now)):
         return
     try:
-        await health.sweep()
+        await health.enqueue_many(store.load_playlists(), skip_if_nothing_due=True, silent=True)
     except Exception as e:
         log.warning("Nightly stream check errored: %s", e)
 
@@ -187,6 +192,9 @@ async def refresh_all_once(force: bool = False) -> None:
 
     if force:
         for playlist in store.load_playlists():
+            if playlist.source == "upload":
+                # Nothing to re-fetch — see _due_playlists.
+                continue
             try:
                 await m3u.sync_playlist(playlist.id, playlist.url, force_refresh=True)
             except Exception as e:

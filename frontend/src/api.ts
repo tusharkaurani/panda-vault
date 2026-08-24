@@ -43,6 +43,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json();
 }
 
+/** Same error handling as `request`, for the handful of endpoints that take
+ *  a file and so can't use a JSON body — the browser sets the multipart
+ *  Content-Type (with its boundary) itself, which is why this doesn't set
+ *  one the way `request` does. */
+async function requestForm<T>(path: string, form: FormData, init?: RequestInit): Promise<T> {
+  const res = await fetch(`/api${path}`, { method: "POST", body: form, ...init });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body.detail || "";
+    } catch {
+      /* ignore */
+    }
+    throw new ApiError(res.status, detail || res.statusText || `Request failed (HTTP ${res.status})`);
+  }
+  if (res.status === 204) return undefined as unknown as T;
+  return res.json();
+}
+
 export { ApiError };
 
 export const api = {
@@ -98,6 +118,28 @@ export const api = {
       allowedExtensions: string[];
       refreshMinutes?: number | null;
     }) => request<Playlist>("/playlists", { method: "POST", body: JSON.stringify(body) }),
+    /** The upload counterpart of create — a multipart form since it carries
+     *  a file, rather than the JSON body every other playlist call uses. */
+    createFromUpload: (body: { name: string; description: string; allowedExtensions: string[]; file: File }) => {
+      const form = new FormData();
+      form.append("name", body.name);
+      form.append("description", body.description);
+      form.append("allowedExtensions", body.allowedExtensions.join(","));
+      form.append("file", body.file);
+      return requestForm<Playlist>("/playlists/upload", form);
+    },
+    /** Replaces an uploaded playlist's file and re-syncs from it. Only valid
+     *  for a playlist that was itself added by upload. `force` carries the
+     *  same meaning as rescan's — the user accepting a snapshot far smaller
+     *  than the one it replaces. */
+    replaceUpload: (id: string, file: File, force = false) => {
+      const form = new FormData();
+      form.append("file", file);
+      return requestForm<{ rebuilding: boolean; jobId: string }>(
+        `/playlists/${id}/upload${force ? "?force=true" : ""}`,
+        form
+      );
+    },
     update: (
       id: string,
       body: Partial<{
@@ -122,14 +164,15 @@ export const api = {
     /** The exact shape of the work a check would do, computed from the
      *  cache — it makes no network requests of its own. */
     streamHealthProfile: () => request<StreamHealthProfile>("/playlists/health/profile"),
-    /** Probe stream URLs now. Omit `id` for every playlist at once. Rejects
-     *  with 409 if a check is already running — only one at a time, so a
-     *  provider never sees two sweeps' worth of traffic. */
-    checkStreams: (id?: string) =>
-      request<{ checking: boolean; jobId: string }>(
-        id ? `/playlists/${id}/health/scan` : "/playlists/health/scan",
-        { method: "POST" }
-      ),
+    /** Queue every playlist's streams for a check. `remaining` only queues a
+     *  playlist with something actually outstanding; `all` queues every
+     *  playlist regardless. Never rejects — a check already running just
+     *  means these join the queue behind it, one job per playlist. */
+    checkAllStreams: (mode: "remaining" | "all" = "all") =>
+      request<{ queued: boolean; jobIds: string[] }>(`/playlists/health/scan?mode=${mode}`, { method: "POST" }),
+    /** Queue one playlist's streams for a check. */
+    checkStreams: (id: string) =>
+      request<{ queued: boolean; jobId: string }>(`/playlists/${id}/health/scan`, { method: "POST" }),
   },
   collections: {
     tree: (sourceType?: SourceType) =>

@@ -2,20 +2,11 @@ import { useState } from "react";
 import { ExternalLink, Play } from "lucide-react";
 import type { DocumentOut } from "../types";
 import { initialsFor, logoSrc } from "../lib/logos";
+import { isPlayableStream, streamExt } from "../lib/streams";
 import CopyLinkButton from "./CopyLinkButton";
 import StreamHealthDot from "./StreamHealthDot";
 import StreamPlayerModal from "./StreamPlayerModal";
 import Tooltip from "./Tooltip";
-
-/** The extension the stream URL ends in — the same thing a playlist's
- *  allowedExtensions filters on, so it's worth surfacing. */
-function streamExt(url?: string | null): string | null {
-  if (!url) return null;
-  const path = url.split("?")[0].split("#")[0];
-  const last = path.split("/").pop() || "";
-  if (!last.includes(".")) return null;
-  return last.split(".").pop()!.toLowerCase().slice(0, 6);
-}
 
 /** One M3U entry. The counterpart to DocumentRow, which can't be reused: an
  *  entry is a live stream, so there is no size, no download, and a logo and
@@ -25,6 +16,7 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
   const [playerOpen, setPlayerOpen] = useState(false);
   const logo = logoFailed ? null : logoSrc(doc.logo);
   const ext = streamExt(doc.url);
+  const playable = isPlayableStream(doc.url);
 
   return (
     <a
@@ -76,28 +68,28 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
       </div>
 
       <div className="flex items-center gap-1 shrink-0">
-        {doc.url && (
-          <>
-            <Tooltip label="Play in browser">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setPlayerOpen(true);
-                }}
-                className="p-1 rounded-md text-panda-muted hover:text-panda-accent"
-              >
-                <Play size={16} />
-              </button>
-            </Tooltip>
-            <CopyLinkButton
-              url={doc.url}
-              label="Copy stream URL"
-              size={16}
+        {playable && (
+          <Tooltip label="Play in browser">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setPlayerOpen(true);
+              }}
               className="p-1 rounded-md text-panda-muted hover:text-panda-accent"
-            />
-          </>
+            >
+              <Play size={16} />
+            </button>
+          </Tooltip>
+        )}
+        {doc.url && (
+          <CopyLinkButton
+            url={doc.url}
+            label="Copy stream URL"
+            size={16}
+            className="p-1 rounded-md text-panda-muted hover:text-panda-accent"
+          />
         )}
         <Tooltip label="Open the stream">
           <span className="p-1 text-panda-muted group-hover:text-panda-accent">
@@ -105,7 +97,7 @@ export default function EntryRow({ doc, sourceName }: { doc: DocumentOut; source
           </span>
         </Tooltip>
       </div>
-      {playerOpen && doc.url && (
+      {playerOpen && playable && doc.url && (
         <StreamPlayerModal url={doc.url} name={doc.name} onClose={() => setPlayerOpen(false)} />
       )}
     </a>

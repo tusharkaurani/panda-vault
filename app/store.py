@@ -16,6 +16,7 @@ PLAYLISTS_PATH = os.path.join(CONFIG_DIR, "playlists.json")
 INTEGRATIONS_PATH = os.path.join(CONFIG_DIR, "integrations.json")
 COLLECTIONS_PATH = os.path.join(CONFIG_DIR, "collections.json")
 _LEGACY_FOLDERS_PATH = os.path.join(CONFIG_DIR, "folders.json")
+UPLOADS_DIR = os.path.join(CONFIG_DIR, "uploads")
 
 _lock = threading.Lock()
 
@@ -53,6 +54,33 @@ def load_playlists() -> List[Playlist]:
 def save_playlists(playlists: List[Playlist]) -> None:
     with _lock:
         _atomic_write(PLAYLISTS_PATH, [p.model_dump() for p in playlists])
+
+
+def _upload_path(playlist_id: str) -> str:
+    return os.path.join(UPLOADS_DIR, f"{playlist_id}.m3u")
+
+
+def save_uploaded_playlist(playlist_id: str, content: bytes) -> None:
+    """Persists the raw bytes of an uploaded playlist file, so a rescan or a
+    server restart can re-parse it without the browser holding onto it."""
+    with _lock:
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+        path = _upload_path(playlist_id)
+        tmp = f"{path}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.replace(tmp, path)
+
+
+def load_uploaded_playlist(playlist_id: str) -> bytes:
+    with open(_upload_path(playlist_id), "rb") as f:
+        return f.read()
+
+
+def delete_uploaded_playlist(playlist_id: str) -> None:
+    path = _upload_path(playlist_id)
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def load_integrations() -> Optional[List[dict]]:

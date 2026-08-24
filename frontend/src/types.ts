@@ -38,8 +38,14 @@ export interface Playlist {
   id: string;
   name: string;
   description: string;
-  /** Remote .m3u / .m3u8 URL, exactly as entered. */
+  /** How this playlist's entries were sourced. "upload" means `url` is
+   *  empty and the entries came from a file the user uploaded — there is
+   *  nothing to periodically re-fetch, only a replacement upload. */
+  source: "url" | "upload";
+  /** Remote .m3u / .m3u8 URL, exactly as entered. Empty when source is "upload". */
   url: string;
+  /** The uploaded file's original name, for display. Set only when source is "upload". */
+  originalFilename: string | null;
   /** Matched against the *stream* URL's extension, not the entry's name. */
   allowedExtensions: string[];
   /** How often to re-fetch, in minutes. null = the server's default. */
@@ -168,6 +174,8 @@ export interface StreamHealthStatus {
   due: number;
   estimatedMinutes: number;
   totals: HealthTotals;
+  /** Playlists queued or actively being checked right now. */
+  queued: number;
 }
 
 // Deliberately flat: this used to carry the whole `Collection` (recursively,
@@ -201,12 +209,16 @@ export interface RebuildJob {
   sourceName: string;
   sourceType: SourceType;
   kind: "scan" | "rebuild" | "health";
-  status: "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error";
   scanned: number;
   total: number | null;
   startedAt: number;
   finishedAt: number | null;
   error?: string | null;
+  /** Routine housekeeping (the nightly stream sweep) — tracked here for
+   *  per-playlist progress, but shouldn't produce a notification-bell toast
+   *  the way a user-triggered job does. */
+  silent?: boolean;
 }
 
 /** One entry in the integration catalog: what this build can connect, and

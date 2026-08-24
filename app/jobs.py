@@ -21,15 +21,16 @@ from . import cache
 from .models import M3U, TELEGRAM, Channel, ChannelOut, Playlist, PlaylistOut, SourceType
 
 _jobs: Dict[str, dict] = {}
-_MAX_JOBS = 50
+_MAX_JOBS = 200
 
 # Job kinds: a source's first pass over its contents vs. a manual full
 # re-scan of one that was already cached. The UI words them differently.
 SCAN = "scan"
 REBUILD = "rebuild"
-# Checking stream URLs, which is not a scan of a source at all — it is
-# always recorded against a synthetic id (see health_source), never a real
-# playlist's, so it can't collide with that playlist's own scan state.
+# Checking stream URLs, which is not a scan of a source at all — recorded
+# against the real playlist so the UI can show per-playlist progress, but
+# excluded from source_status()'s "is this source busy" check below so it
+# never turns a playlist's own status pill to "scanning".
 HEALTH = "health"
 
 # Distinguishes "caller didn't pass a count" from a count of None, which is
@@ -52,7 +53,20 @@ class Source(Protocol):
     allowedExtensions: Sequence[str]
 
 
-def record(source: Source, kind: str, source_type: SourceType = TELEGRAM) -> str:
+def record(
+    source: Source,
+    kind: str,
+    source_type: SourceType = TELEGRAM,
+    status: str = "running",
+    silent: bool = False,
+) -> str:
+    """`status` lets a caller record a job as "queued" — work accepted but
+    not yet started, e.g. a stream check waiting behind others in
+    health.py's queue — rather than "running" from the moment it exists.
+
+    `silent` is for routine housekeeping (the nightly stream sweep) that
+    still wants per-playlist progress tracked here, but shouldn't fire a
+    notification-bell toast the way a user-triggered check does."""
     job_id = uuid.uuid4().hex
     _jobs[job_id] = {
         "id": job_id,
@@ -60,17 +74,39 @@ def record(source: Source, kind: str, source_type: SourceType = TELEGRAM) -> str
         "sourceName": source.name,
         "sourceType": source_type,
         "kind": kind,
-        "status": "running",
+        "status": status,
         "scanned": 0,
         "total": None,
         "startedAt": time.time(),
         "finishedAt": None,
         "error": None,
+        "silent": silent,
     }
     if len(_jobs) > _MAX_JOBS:
-        oldest = sorted(_jobs.values(), key=lambda j: j["startedAt"])[0]
+        # Prefer evicting a finished job over a queued/running one — a large
+        # "scan all" can legitimately have dozens of jobs still queued at
+        # once, and losing track of one would strand it "running" forever
+        # in the UI even though health.py's queue has moved past it.
+        terminal = [j for j in _jobs.values() if j["status"] in ("done", "error")]
+        oldest = sorted(terminal or list(_jobs.values()), key=lambda j: j["startedAt"])[0]
         del _jobs[oldest["id"]]
     return job_id
+
+
+def start(job_id: str) -> None:
+    """Flip a queued job to running once the worker actually picks it up."""
+    job = _jobs.get(job_id)
+    if job:
+        job["status"] = "running"
+
+
+def unsilence(job_id: str) -> None:
+    """A manual check coalesced onto an already-queued silent (nightly) job
+    — the user does still want to hear about this one, so it stops being
+    silent rather than the click going unacknowledged."""
+    job = _jobs.get(job_id)
+    if job:
+        job["silent"] = False
 
 
 def progress_cb(job_id: str) -> Callable:
@@ -100,30 +136,6 @@ def all_jobs() -> List[dict]:
 
 def for_source(source_id: str) -> List[dict]:
     return [j for j in _jobs.values() if j["sourceId"] == source_id]
-
-
-class _SyntheticSource:
-    """A stand-in Source for work that isn't about one stored source.
-
-    jobs.record only needs id/name/allowedExtensions, and a stream check
-    spans every playlist at once. Giving it an id of its own — rather than
-    borrowing a real playlist's — is what keeps it out of that playlist's
-    status pill and out of the UI's jobsBySource map, while still reaching
-    the notification bell like any other job.
-    """
-
-    allowedExtensions = ()
-
-    def __init__(self, id: str, name: str):
-        self.id = id
-        self.name = name
-
-
-def health_source(playlist_name: Optional[str] = None) -> _SyntheticSource:
-    return _SyntheticSource(
-        f"stream-health:{playlist_name}" if playlist_name else "stream-health",
-        f"Streams in {playlist_name}" if playlist_name else "All streams",
-    )
 
 
 def _count_for(source: Source) -> Optional[int]:

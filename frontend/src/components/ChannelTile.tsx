@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Play } from "lucide-react";
 import type { DocumentOut } from "../types";
 import { initialsFor, logoSrc } from "../lib/logos";
+import { isPlayableStream } from "../lib/streams";
 import StreamHealthDot from "./StreamHealthDot";
 import StreamPlayerModal from "./StreamPlayerModal";
 import Tooltip from "./Tooltip";
@@ -13,6 +14,7 @@ export default function ChannelTile({ doc }: { doc: DocumentOut }) {
   const [logoFailed, setLogoFailed] = useState(false);
   const [playerOpen, setPlayerOpen] = useState(false);
   const logo = logoFailed ? null : logoSrc(doc.logo);
+  const playable = isPlayableStream(doc.url);
 
   return (
     <a
@@ -44,7 +46,7 @@ export default function ChannelTile({ doc }: { doc: DocumentOut }) {
         )}
       </div>
       <span className="w-full truncate text-base font-medium">{doc.name}</span>
-      {doc.url && (
+      {playable && (
         <Tooltip label="Play in browser">
           <button
             type="button"
@@ -59,7 +61,7 @@ export default function ChannelTile({ doc }: { doc: DocumentOut }) {
           </button>
         </Tooltip>
       )}
-      {playerOpen && doc.url && (
+      {playerOpen && playable && doc.url && (
         <StreamPlayerModal url={doc.url} name={doc.name} onClose={() => setPlayerOpen(false)} />
       )}
     </a>

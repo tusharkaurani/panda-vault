@@ -4,20 +4,20 @@ import { api, ApiError } from "../../api";
 import type { StreamHealthProfile, StreamHealthStatus } from "../../types";
 import { timeAgoUnix } from "../../lib/time";
 import { useNotifications } from "../../notifications/NotificationContext";
-import ScanProgress from "../ScanProgress";
 
 /** Stream checking: what it found last night, and a way to run it now.
  *
- *  Sits above the playlist list rather than on each row because the check is
- *  vault-wide and URL-keyed — the same stream in three playlists is one
- *  probe — so per-playlist buttons would imply an independence that doesn't
- *  exist.
+ *  Checking is per-playlist under the hood (health.enqueue), each with its
+ *  own job and its own progress bar on that playlist's row in the list
+ *  below. This panel is the vault-wide entry point — "check everything" —
+ *  and shows a summary rather than one big progress bar, since there's no
+ *  single job spanning every playlist any more.
  */
 export default function StreamCheckPanel({ onChanged }: { onChanged: () => void }) {
-  const { pushToast, jobsCompleted, healthJob } = useNotifications();
+  const { pushToast, jobsCompleted, healthJobs } = useNotifications();
   const [status, setStatus] = useState<StreamHealthStatus | null>(null);
   const [profile, setProfile] = useState<StreamHealthProfile | null>(null);
-  const [starting, setStarting] = useState(false);
+  const [starting, setStarting] = useState<"remaining" | "all" | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -46,15 +46,18 @@ export default function StreamCheckPanel({ onChanged }: { onChanged: () => void 
   // off the job feed rather than status.running so the poll starts on the
   // very next tick after the job appears, not after the summary catches up.
   useEffect(() => {
-    if (!healthJob && !status?.running) return;
+    if (!healthJobs.length && !status?.running) return;
     const t = setInterval(load, 5000);
     return () => clearInterval(t);
-  }, [healthJob, status?.running, load]);
+  }, [healthJobs.length, status?.running, load]);
 
-  async function check() {
+  async function check(mode: "remaining" | "all") {
     if (!status) return;
     // The profile is exact where the summary is a rough estimate, so lead
     // with it when it's loaded — the numbers are the whole point of asking.
+    // Both modes probe the same due URLs; "all" only differs in queuing a
+    // job for a playlist with nothing outstanding too, so one estimate
+    // covers either.
     const detail = profile
       ? `${profile.dueUrls.toLocaleString()} stream URLs across ${profile.hosts.toLocaleString()} providers.\n\n` +
         `That means roughly ${profile.requests.min.toLocaleString()}–${profile.requests.max.toLocaleString()} requests ` +
@@ -69,17 +72,17 @@ export default function StreamCheckPanel({ onChanged }: { onChanged: () => void 
         `keep using the app while it works.`
     );
     if (!ok) return;
-    setStarting(true);
+    setStarting(mode);
     try {
-      await api.playlists.checkStreams();
-      pushToast("Checking streams — you'll get notified when it's done.", "info");
+      await api.playlists.checkAllStreams(mode);
+      pushToast("Checking streams — you'll get notified as each playlist finishes.", "info");
       load();
       loadProfile();
       onChanged();
     } catch (e) {
       pushToast(e instanceof ApiError ? e.message : "Failed to start the check", "error");
     } finally {
-      setStarting(false);
+      setStarting(null);
     }
   }
 
@@ -88,6 +91,8 @@ export default function StreamCheckPanel({ onChanged }: { onChanged: () => void 
   const t = status.totals;
   const known = (t.available ?? 0) + (t.unavailable ?? 0) + (t.unknown ?? 0);
   const nothingToCheck = status.due === 0 && known === 0;
+  const runningNow = healthJobs.filter((j) => j.status === "running").length;
+  const waitingCount = healthJobs.length - runningNow;
 
   return (
     <div className="rounded-lg border border-panda-border bg-panda-surface px-4 py-3 flex items-start gap-3 flex-wrap">
@@ -131,32 +136,38 @@ export default function StreamCheckPanel({ onChanged }: { onChanged: () => void 
             ~{profile.approxMegabytes}MB · {profile.minutes.min}–{profile.minutes.max} min
           </p>
         )}
-        {healthJob && <ScanProgress job={healthJob} unit="streams" />}
         <p className="text-xs text-panda-muted mt-0.5">
-          {healthJob || status.running
-            ? "Running now — results appear as they come in."
+          {healthJobs.length > 0
+            ? `Checking now — ${runningNow} playlist in progress${waitingCount ? `, ${waitingCount} queued` : ""}. See each playlist's row for progress.`
             : status.lastSweepAt
               ? `Last run ${timeAgoUnix(status.lastSweepAt)}. Runs again overnight.`
               : "Runs overnight, or start one now."}
         </p>
       </div>
-      <button
-        onClick={check}
-        disabled={starting || status.running || !!healthJob || status.due === 0}
-        title={
-          status.due === 0
-            ? "Everything has been checked recently — the next run is overnight"
-            : "Check every stream URL now"
-        }
-        className="flex items-center gap-1.5 rounded-lg border border-panda-border px-3 py-1.5 text-sm hover:border-panda-accent disabled:opacity-50"
-      >
-        {starting || status.running || healthJob ? (
-          <Loader2 size={15} className="animate-spin" />
-        ) : (
-          <Activity size={15} />
-        )}
-        {status.running || healthJob ? "Checking…" : "Check now"}
-      </button>
+      <div className="flex items-center gap-2 shrink-0">
+        <button
+          onClick={() => check("remaining")}
+          disabled={!!starting || status.due === 0}
+          title={
+            status.due === 0
+              ? "Everything has been checked recently — the next run is overnight"
+              : "Check only playlists with something outstanding"
+          }
+          className="flex items-center gap-1.5 rounded-lg border border-panda-border px-3 py-1.5 text-sm hover:border-panda-accent disabled:opacity-50"
+        >
+          {starting === "remaining" ? <Loader2 size={15} className="animate-spin" /> : <Activity size={15} />}
+          Scan remaining
+        </button>
+        <button
+          onClick={() => check("all")}
+          disabled={!!starting}
+          title="Check every playlist now, even ones checked recently"
+          className="flex items-center gap-1.5 rounded-lg border border-panda-border px-3 py-1.5 text-sm hover:border-panda-accent disabled:opacity-50"
+        >
+          {starting === "all" ? <Loader2 size={15} className="animate-spin" /> : <Activity size={15} />}
+          Scan all
+        </button>
+      </div>
     </div>
   );
 }

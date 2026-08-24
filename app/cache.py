@@ -726,6 +726,38 @@ def iter_names(scope: Sequence[SourceScope]) -> Iterator[str]:
             yield row[0]
 
 
+def iter_documents(scope: Sequence[SourceScope], sort: str = "date_asc") -> Iterator[DocumentOut]:
+    """Stream every document across `scope` in `sort` order, for an export
+    that wants every row rather than one page — see query_documents, which
+    is built around a single LIMIT/OFFSET page instead. No stream_health
+    join: an export doesn't need reachability, just what to write out.
+
+    Fetches everything before releasing `_lock`, rather than holding it
+    across a `yield` (as `iter_names` does): this feeds a client-paced
+    StreamingResponse, and a generator suspended mid-`with _lock:` keeps
+    the lock held for as long as the client is slow to read — which stalls
+    every other request in the app, not just this one."""
+    where, params = _scope_sql(scope)
+    order = _SORTS.get(sort, _SORTS[_DEFAULT_SORT])
+    with _lock:
+        rows = _conn.execute(
+            f"SELECT {_DOC_COLUMNS} FROM documents d WHERE {where} ORDER BY {order}", params
+        ).fetchall()
+    for row in rows:
+        yield DocumentOut(
+                id=row["msg_id"],
+                name=row["name"],
+                size=row["size"],
+                date=row["date"],
+                mime_type=row["mime_type"],
+                sourceId=row["channel_id"],
+                sourceType=row["source_type"],
+                url=row["url"],
+                logo=row["logo"],
+                group=row["group_title"],
+            )
+
+
 def has_source(channel_id: str) -> bool:
     """Whether this channel has ever been scanned. A channel with a meta row
     but zero documents is 'scanned and empty', not 'unscanned'."""
