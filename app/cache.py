@@ -38,16 +38,49 @@ SCHEMA_VERSION = 4
 
 log = logging.getLogger("panda_vault.cache")
 
-# One shared connection guarded by a lock. The connection is genuinely
-# cross-thread: a few routes are sync `def` (so FastAPI runs them on the
-# anyio threadpool) while the rest are `async def` on the event loop, and
-# scans hand slow work to asyncio.to_thread. sqlite3.threadsafety == 3
+# One shared *write* connection guarded by a lock. The connection is
+# genuinely cross-thread: a few routes are sync `def` (so FastAPI runs them
+# on the anyio threadpool) while the rest are `async def` on the event loop,
+# and scans hand slow work to asyncio.to_thread. sqlite3.threadsafety == 3
 # makes sharing legal, but statements from concurrent threads would still
-# interleave inside a transaction — hence the lock on every access, the
-# same pattern store.py uses. Contention is a non-issue: the slowest
-# query here is the ~15ms global search scan.
+# interleave inside a transaction — hence the lock on every write, the same
+# pattern store.py uses.
+#
+# Reads do NOT go through this connection or lock — see _read_conn below.
+# They used to, and it was a real problem: replace_source_documents (an M3U
+# snapshot swap) deletes and re-inserts every entry in one transaction, and
+# on a Raspberry Pi's SD card that can take seconds. Every other request
+# touching the cache — completely unrelated playlists, the notification
+# bell, ordinary browsing — was queued behind that same lock, so one big
+# playlist rescan looked like the whole app freezing.
 _conn: Optional[sqlite3.Connection] = None
 _lock = threading.RLock()
+
+# A read connection per thread rather than one shared reader: two threads
+# sharing a single sqlite3.Connection would need the same interleaving
+# protection _lock gives writes, which just reintroduces cross-request
+# stalls on the read side. A separate connection per thread needs no lock at
+# all — each has its own handle, and WAL gives each one an independent,
+# consistent snapshot that never blocks on (or blocks) the writer.
+_read_local = threading.local()
+_read_conns_lock = threading.Lock()
+_all_read_conns: List[sqlite3.Connection] = []
+# Bumped when the underlying file is replaced (see _quarantine_db) so a
+# thread's cached read connection — which would otherwise still point at
+# the old, now-quarantined file — gets reopened against the current one.
+_generation = 0
+
+
+def _read_conn() -> sqlite3.Connection:
+    conn = getattr(_read_local, "conn", None)
+    if conn is None or getattr(_read_local, "generation", -1) != _generation:
+        conn = _connect()
+        _read_local.conn = conn
+        _read_local.generation = _generation
+        with _read_conns_lock:
+            _all_read_conns.append(conn)
+    return conn
+
 
 # (source_id, allowed_extensions) — the unit every read query works in.
 # A source is a Telegram channel or an M3U playlist; they share one id
@@ -355,13 +388,17 @@ def init() -> None:
 
 
 def _quarantine_db() -> None:
-    global _conn
+    global _conn, _generation
     if _conn is not None:
         try:
             _conn.close()
         except sqlite3.Error:
             pass
         _conn = None
+    # Existing threads' read connections still hold the old (about-to-be
+    # renamed) file open — this makes each reopen against the current file
+    # the next time it's used, rather than keep reading the quarantined one.
+    _generation += 1
     stamp = int(time.time())
     # The -wal/-shm sidecars belong to the file being moved aside; leaving
     # them behind would let a stale journal be replayed into the new one.
@@ -521,6 +558,13 @@ def close() -> None:
                 pass
             _conn.close()
             _conn = None
+    with _read_conns_lock:
+        for conn in _all_read_conns:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        _all_read_conns.clear()
 
 
 # --------------------------------------------------------------------------
@@ -602,19 +646,17 @@ def query_documents(
     params += health_params
 
     order = _SORTS.get(sort, _SORTS[_DEFAULT_SORT])
-    with _lock:
-        # The count only needs the join when it is being filtered on — the
-        # common unfiltered listing stays a single-table count.
-        count_from = _JOIN_HEALTH if health_sql else "documents d"
-        total = _conn.execute(
-            f"SELECT COUNT(*) FROM {count_from} WHERE {where}", params
-        ).fetchone()[0]
-        rows = _conn.execute(
-            f"SELECT {_DOC_COLUMNS}, h.status AS health, h.checked_at AS health_checked_at"
-            f" FROM {_JOIN_HEALTH}"
-            f" WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
-            params + [limit, offset],
-        ).fetchall()
+    conn = _read_conn()
+    # The count only needs the join when it is being filtered on — the
+    # common unfiltered listing stays a single-table count.
+    count_from = _JOIN_HEALTH if health_sql else "documents d"
+    total = conn.execute(f"SELECT COUNT(*) FROM {count_from} WHERE {where}", params).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT {_DOC_COLUMNS}, h.status AS health, h.checked_at AS health_checked_at"
+        f" FROM {_JOIN_HEALTH}"
+        f" WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    ).fetchall()
     return [_row_to_doc(r) for r in rows], total
 
 
@@ -646,11 +688,10 @@ def list_groups(
     where += health_sql
     params += health_params
     from_clause = _JOIN_HEALTH if health_sql else "documents d"
-    with _lock:
-        rows = _conn.execute(
-            f"SELECT group_title, COUNT(*) FROM {from_clause} WHERE {where} GROUP BY group_title",
-            params,
-        ).fetchall()
+    rows = _read_conn().execute(
+        f"SELECT group_title, COUNT(*) FROM {from_clause} WHERE {where} GROUP BY group_title",
+        params,
+    ).fetchall()
     tally: Dict[str, int] = {}
     for group_title, entry_count in rows:
         raw = (group_title or "").strip()
@@ -670,12 +711,11 @@ def stream_health_summary(scope: Sequence[SourceScope]) -> Dict[str, int]:
     if not scope:
         return {}
     where, params = _scope_sql(scope)
-    with _lock:
-        rows = _conn.execute(
-            f"SELECT COALESCE(h.status, ?) AS state, COUNT(*) FROM {_JOIN_HEALTH}"
-            f" WHERE {where} AND d.url IS NOT NULL GROUP BY state",
-            [STREAM_UNCHECKED] + list(params),
-        ).fetchall()
+    rows = _read_conn().execute(
+        f"SELECT COALESCE(h.status, ?) AS state, COUNT(*) FROM {_JOIN_HEALTH}"
+        f" WHERE {where} AND d.url IS NOT NULL GROUP BY state",
+        [STREAM_UNCHECKED] + list(params),
+    ).fetchall()
     return {r[0]: r[1] for r in rows}
 
 
@@ -690,19 +730,19 @@ def source_counts(scope: Sequence[SourceScope]) -> Dict[str, Optional[int]]:
     channel_ids = [cid for cid, _ in scope]
     where, params = _scope_sql(scope)
     ph = ",".join("?" * len(channel_ids))
-    with _lock:
-        counted = dict(
-            _conn.execute(
-                f"SELECT channel_id, COUNT(*) FROM documents WHERE {where} GROUP BY channel_id",
-                params,
-            ).fetchall()
-        )
-        known = {
-            r[0]
-            for r in _conn.execute(
-                f"SELECT channel_id FROM channels_meta WHERE channel_id IN ({ph})", channel_ids
-            ).fetchall()
-        }
+    conn = _read_conn()
+    counted = dict(
+        conn.execute(
+            f"SELECT channel_id, COUNT(*) FROM documents WHERE {where} GROUP BY channel_id",
+            params,
+        ).fetchall()
+    )
+    known = {
+        r[0]
+        for r in conn.execute(
+            f"SELECT channel_id FROM channels_meta WHERE channel_id IN ({ph})", channel_ids
+        ).fetchall()
+    }
     return {cid: (counted.get(cid, 0) if cid in known else None) for cid in channel_ids}
 
 
@@ -710,10 +750,9 @@ def count_documents(channel_id: str) -> int:
     """Unfiltered document count for one channel — compared against
     Telegram's own file count to detect deletions, so it must ignore
     extension allowlists the same way that count does."""
-    with _lock:
-        return _conn.execute(
-            "SELECT COUNT(*) FROM documents WHERE channel_id = ?", (channel_id,)
-        ).fetchone()[0]
+    return _read_conn().execute(
+        "SELECT COUNT(*) FROM documents WHERE channel_id = ?", (channel_id,)
+    ).fetchone()[0]
 
 
 def iter_names(scope: Sequence[SourceScope]) -> Iterator[str]:
@@ -721,28 +760,20 @@ def iter_names(scope: Sequence[SourceScope]) -> Iterator[str]:
     rather than returned as a list so a 66k-document collection never
     materializes all of its names at once."""
     where, params = _scope_sql(scope)
-    with _lock:
-        for row in _conn.execute(f"SELECT name FROM documents WHERE {where}", params):
-            yield row[0]
+    for row in _read_conn().execute(f"SELECT name FROM documents WHERE {where}", params):
+        yield row[0]
 
 
 def iter_documents(scope: Sequence[SourceScope], sort: str = "date_asc") -> Iterator[DocumentOut]:
     """Stream every document across `scope` in `sort` order, for an export
     that wants every row rather than one page — see query_documents, which
     is built around a single LIMIT/OFFSET page instead. No stream_health
-    join: an export doesn't need reachability, just what to write out.
-
-    Fetches everything before releasing `_lock`, rather than holding it
-    across a `yield` (as `iter_names` does): this feeds a client-paced
-    StreamingResponse, and a generator suspended mid-`with _lock:` keeps
-    the lock held for as long as the client is slow to read — which stalls
-    every other request in the app, not just this one."""
+    join: an export doesn't need reachability, just what to write out."""
     where, params = _scope_sql(scope)
     order = _SORTS.get(sort, _SORTS[_DEFAULT_SORT])
-    with _lock:
-        rows = _conn.execute(
-            f"SELECT {_DOC_COLUMNS} FROM documents d WHERE {where} ORDER BY {order}", params
-        ).fetchall()
+    rows = _read_conn().execute(
+        f"SELECT {_DOC_COLUMNS} FROM documents d WHERE {where} ORDER BY {order}", params
+    ).fetchall()
     for row in rows:
         yield DocumentOut(
                 id=row["msg_id"],
@@ -761,20 +792,18 @@ def iter_documents(scope: Sequence[SourceScope], sort: str = "date_asc") -> Iter
 def has_source(channel_id: str) -> bool:
     """Whether this channel has ever been scanned. A channel with a meta row
     but zero documents is 'scanned and empty', not 'unscanned'."""
-    with _lock:
-        return (
-            _conn.execute(
-                "SELECT 1 FROM channels_meta WHERE channel_id = ?", (channel_id,)
-            ).fetchone()
-            is not None
-        )
+    return (
+        _read_conn().execute(
+            "SELECT 1 FROM channels_meta WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        is not None
+    )
 
 
 def get_fetched_at(channel_id: str) -> Optional[float]:
-    with _lock:
-        row = _conn.execute(
-            "SELECT fetched_at FROM channels_meta WHERE channel_id = ?", (channel_id,)
-        ).fetchone()
+    row = _read_conn().execute(
+        "SELECT fetched_at FROM channels_meta WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
     return row[0] if row else None
 
 
@@ -791,10 +820,9 @@ def _health_row(row: sqlite3.Row) -> dict:
 def get_source_health(source_id: str) -> Optional[dict]:
     """How this source's last fetch went, or None if one has never been
     attempted — which is not the same as one having failed."""
-    with _lock:
-        row = _conn.execute(
-            "SELECT * FROM source_health WHERE source_id = ?", (source_id,)
-        ).fetchone()
+    row = _read_conn().execute(
+        "SELECT * FROM source_health WHERE source_id = ?", (source_id,)
+    ).fetchone()
     return _health_row(row) if row else None
 
 
@@ -804,20 +832,18 @@ def source_health_many(source_ids: Sequence[str]) -> Dict[str, dict]:
     if not source_ids:
         return {}
     ph = ",".join("?" * len(source_ids))
-    with _lock:
-        rows = _conn.execute(
-            f"SELECT * FROM source_health WHERE source_id IN ({ph})", list(source_ids)
-        ).fetchall()
+    rows = _read_conn().execute(
+        f"SELECT * FROM source_health WHERE source_id IN ({ph})", list(source_ids)
+    ).fetchall()
     return {r["source_id"]: _health_row(r) for r in rows}
 
 
 def get_max_id(channel_id: str) -> int:
     """Highest Telegram message ID captured so far, used as the `min_id`
     cursor for incremental refreshes. 0 for a channel never fully scanned."""
-    with _lock:
-        row = _conn.execute(
-            "SELECT max_id FROM channels_meta WHERE channel_id = ?", (channel_id,)
-        ).fetchone()
+    row = _read_conn().execute(
+        "SELECT max_id FROM channels_meta WHERE channel_id = ?", (channel_id,)
+    ).fetchone()
     return row[0] if row else 0
 
 
@@ -976,13 +1002,12 @@ def urls_needing_check(
     of the list forever.
     """
     where, params = _due_sql(scope, checked_before, backoff_after, backoff_max_days)
-    with _lock:
-        rows = _conn.execute(
-            f"SELECT DISTINCT d.url, COALESCE(h.fail_streak, 0), h.checked_at"
-            f" FROM {_JOIN_HEALTH} WHERE {where}"
-            " ORDER BY h.checked_at IS NOT NULL, h.checked_at LIMIT ?",
-            params + [limit],
-        ).fetchall()
+    rows = _read_conn().execute(
+        f"SELECT DISTINCT d.url, COALESCE(h.fail_streak, 0), h.checked_at"
+        f" FROM {_JOIN_HEALTH} WHERE {where}"
+        " ORDER BY h.checked_at IS NOT NULL, h.checked_at LIMIT ?",
+        params + [limit],
+    ).fetchall()
     return [(r[0], r[1]) for r in rows]
 
 
@@ -997,10 +1022,9 @@ def count_urls_needing_check(
     SQL rather than measuring the list urls_needing_check would build,
     because this is polled by a settings page."""
     where, params = _due_sql(scope, checked_before, backoff_after, backoff_max_days)
-    with _lock:
-        return _conn.execute(
-            f"SELECT COUNT(DISTINCT d.url) FROM {_JOIN_HEALTH} WHERE {where}", params
-        ).fetchone()[0]
+    return _read_conn().execute(
+        f"SELECT COUNT(DISTINCT d.url) FROM {_JOIN_HEALTH} WHERE {where}", params
+    ).fetchone()[0]
 
 
 def record_stream_health(rows: Sequence[tuple]) -> None:
@@ -1050,8 +1074,7 @@ def prune_stream_health() -> int:
 
 
 def get_setting(key: str) -> Optional[str]:
-    with _lock:
-        row = _conn.execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
+    row = _read_conn().execute("SELECT value FROM schema_meta WHERE key = ?", (key,)).fetchone()
     return row[0] if row else None
 
 
