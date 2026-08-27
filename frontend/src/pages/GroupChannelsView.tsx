@@ -4,6 +4,7 @@ import { Home, Loader2 } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Collection, DocumentOut, HealthTotals } from "../types";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
+import { useStreamHealthFilter } from "../lib/useStreamHealthFilter";
 import { useIntegrations } from "../integrations/IntegrationsContext";
 import { findPath } from "../lib/collections";
 import { groupParamFromUrl } from "../components/GroupedChannels";
@@ -34,7 +35,7 @@ export default function GroupChannelsView() {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const debouncedSearch = useDebouncedValue(search, 350);
-  const [health, setHealth] = useState<string>("");
+  const [health, setHealth] = useStreamHealthFilter();
   const [healthTotals, setHealthTotals] = useState<HealthTotals>({});
   const [loadingMore, setLoadingMore] = useState(false);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -93,8 +94,6 @@ export default function GroupChannelsView() {
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collectionId, group, debouncedSearch, health]);
-
-  useEffect(() => setHealth(""), [collectionId, group]);
 
   useEffect(() => {
     const el = sentinelRef.current;

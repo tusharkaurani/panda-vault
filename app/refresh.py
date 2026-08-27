@@ -23,7 +23,8 @@ import asyncio
 import logging
 import os
 import time
-from typing import List, Optional
+import urllib.parse
+from typing import Dict, List, Optional
 
 from . import cache, health, m3u, store, telegram_client
 from .models import Playlist
@@ -46,7 +47,7 @@ M3U_REFRESH_MINUTES = int(os.environ.get("M3U_REFRESH_MINUTES", "1440"))  # 24h
 
 # Anything on a daily-or-slower interval is heavy enough to want the quiet
 # hours rather than whenever the process happened to start. Local time.
-NIGHTLY_HOUR = int(os.environ.get("PANDA_NIGHTLY_HOUR", "3"))
+NIGHTLY_HOUR = int(os.environ.get("PANDA_NIGHTLY_HOUR", "6"))
 NIGHTLY_WINDOW_HOURS = int(os.environ.get("PANDA_NIGHTLY_WINDOW_HOURS", "2"))
 
 # Below this, an interval is short enough that waiting for tonight would
@@ -63,9 +64,21 @@ _OVERDUE_FACTOR = 1.5
 # still recovers on its own once the provider comes back.
 _MAX_BACKOFF = 4
 
-# Between sources, so a cycle trickles rather than bursting at whichever
-# provider is being refreshed.
+# Between sources, so a Telegram refresh cycle trickles rather than bursting
+# at the account's own rate limits. Playlists are throttled differently, per
+# provider — see REFRESH_CONCURRENCY/REFRESH_PER_HOST below.
 _SPACING_SECONDS = 2
+
+# Playlist syncs in flight across all hosts during a batch refresh. Mirrors
+# health.py's CONCURRENCY/PER_HOST split — network-bound work, so this is
+# about not serializing dozens of due playlists behind a fixed sleep, not
+# about CPU.
+REFRESH_CONCURRENCY = int(os.environ.get("PLAYLIST_REFRESH_CONCURRENCY", "10"))
+
+# Playlist syncs in flight *per host* — keeps a burst of same-provider
+# playlists from landing on it all at once, the way health.py's PER_HOST
+# does for stream probes.
+REFRESH_PER_HOST = int(os.environ.get("PLAYLIST_REFRESH_PER_HOST", "2"))
 
 _task: Optional[asyncio.Task] = None
 _last_telegram_cycle: float = 0.0
@@ -141,22 +154,37 @@ async def _refresh_telegram() -> None:
 
 
 async def _refresh_playlists(now: float) -> None:
-    due = _due_playlists(now)
+    # _due_playlists is synchronous cache.py work (source_health_many,
+    # get_fetched_at) — off the event loop thread, or it blocks on
+    # cache._lock (and therefore every other request) whenever a health
+    # sweep or an m3u sync happens to be mid-transaction at the same tick.
+    due = await asyncio.to_thread(_due_playlists, now)
     if not due:
         return
     log.info("Refreshing %d playlist(s) due for it", len(due))
-    for playlist in due:
-        try:
-            # The shrink guard stays on for scheduled refreshes: an
-            # unattended job must never be the thing that throws away a
-            # snapshot the user cannot get back. Overriding it is a
-            # deliberate act, from the rescan endpoint.
-            await m3u.sync_playlist(playlist.id, playlist.url, force_refresh=True)
-        except Exception as e:
-            # Already recorded against the source's health inside
-            # sync_playlist, so the UI shows it — this is just the log line.
-            log.warning("Background refresh failed for playlist %s: %s", playlist.id, e)
-        await asyncio.sleep(_SPACING_SECONDS)
+
+    gate = asyncio.Semaphore(REFRESH_CONCURRENCY)
+    host_gates: Dict[str, asyncio.Semaphore] = {}
+
+    async def one(playlist: Playlist) -> None:
+        host = (urllib.parse.urlsplit(playlist.url).hostname or "").lower()
+        host_gate = host_gates.setdefault(host, asyncio.Semaphore(REFRESH_PER_HOST))
+        # Per-host gate first, then the global gate: a slot is only held
+        # while there is real work to do with it — same ordering as
+        # health.py's _probe_scope.
+        async with host_gate, gate:
+            try:
+                # The shrink guard stays on for scheduled refreshes: an
+                # unattended job must never be the thing that throws away a
+                # snapshot the user cannot get back. Overriding it is a
+                # deliberate act, from the rescan endpoint.
+                await m3u.sync_playlist(playlist.id, playlist.url, force_refresh=True)
+            except Exception as e:
+                # Already recorded against the source's health inside
+                # sync_playlist, so the UI shows it — this is just the log line.
+                log.warning("Background refresh failed for playlist %s: %s", playlist.id, e)
+
+    await asyncio.gather(*(one(playlist) for playlist in due))
 
 
 async def _sweep_streams(now: float) -> None:

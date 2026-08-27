@@ -147,7 +147,12 @@ Library root the UI renders.
   scheduler, a manual rescan and a collection open all leave the same trail. `#EXTGRP` is sticky (it applies
   to every following entry until changed); `group-title` still beats it. The
   #EXTINF attribute/title split is on the first comma *outside* quotes, because
-  `group-title="News, Sport"` is common.
+  `group-title="News, Sport"` is common. The blocking fetch/parse/write
+  (`_sync_blocking`) runs on its own `ThreadPoolExecutor` (`_get_pool`,
+  `M3U_SYNC_POOL_SIZE`) rather than `asyncio.to_thread`'s shared default one —
+  `refresh.py` now syncs several due playlists concurrently, and sharing the
+  default pool with that would crowd out ordinary cache reads, same reasoning
+  as `health.py`'s own dedicated pool below.
 - `health.py` — probing the stream URLs *inside* a playlist, as opposed to the
   playlist URL itself. Separate from `m3u.py` because it runs on its own
   schedule, keys on URLs rather than playlists, and its results outlive any
@@ -163,8 +168,9 @@ Library root the UI renders.
   hardware**, hence `PER_HOST` mattering more than `CONCURRENCY`. One failure
   marks a URL `unknown`, two consecutive ones `unavailable` (`_verdict`), so a
   bad night doesn't turn a library red. Probes run on their **own**
-  ThreadPoolExecutor — asyncio's shared default pool also serves cache reads
-  and playlist syncs, and an hour-long sweep would starve them.
+  ThreadPoolExecutor — asyncio's shared default pool also serves cache reads,
+  and an hour-long sweep would starve them. `m3u.py`'s own sync work has since
+  gotten the same treatment, for the same reason.
 - `refresh.py` — the periodic background refresh for *all* source types. Used to
   live in `telegram_client`; it moved so a second source type didn't need either a
   competing loop or an import of `m3u` from the Telegram module. Not tracked in
@@ -179,12 +185,21 @@ Library root the UI renders.
   channels (`TG_CACHE_REFRESH_SECONDS`, incremental and usually free); playlists
   are due individually, per `Playlist.refreshMinutes` or `M3U_REFRESH_MINUTES`,
   because each one is a full re-download. Anything on a daily-or-slower interval
-  waits for the nightly window (`PANDA_NIGHTLY_HOUR`) unless it's overdue by
-  `_OVERDUE_FACTOR`, which is what stops a machine that's asleep at 3am from
-  never refreshing at all. Due-ness reads `source_health.last_attempt_at`, **not**
-  `fetched_at`: the latter only moves when documents are written, so a dead URL
-  would look permanently overdue and be retried every tick. Consecutive failures
-  back the interval off, capped so it still recovers on its own.
+  waits for the nightly window (`PANDA_NIGHTLY_HOUR`, 6am local by default) unless
+  it's overdue by `_OVERDUE_FACTOR`, which is what stops a machine that's asleep
+  at that hour from never refreshing at all. Due-ness reads
+  `source_health.last_attempt_at`, **not** `fetched_at`: the latter only moves
+  when documents are written, so a dead URL would look permanently overdue and be
+  retried every tick. Consecutive failures back the interval off, capped so it
+  still recovers on its own.
+  Due playlists refresh concurrently rather than one at a time — the nightly
+  window routinely brings a whole batch due together, and serializing them
+  behind a fixed sleep just adds wall-clock for no reason. `_refresh_playlists`
+  gates each sync behind a per-host `asyncio.Semaphore` (`REFRESH_PER_HOST`,
+  keyed on the playlist URL's hostname) acquired before a global one
+  (`REFRESH_CONCURRENCY`) — same two-tier ordering as `health.py`'s
+  `_probe_scope`, so a burst of due playlists can't land on one provider at
+  once even though the batch as a whole runs in parallel.
 - `jobs.py` — scan/rebuild tracking, **in-memory only, never persisted**.
   A `HEALTH` job is always recorded against a synthetic id (`health_source`),
   never a real playlist's — that keeps it out of the playlist's status pill

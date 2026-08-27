@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterator, List, Optional
 
@@ -112,6 +113,22 @@ def _lock_for(playlist_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _playlist_locks[playlist_id] = lock
     return lock
+
+
+# Fetch + parse + write for a sync runs here rather than on
+# asyncio.to_thread's shared default executor — a batch of concurrently
+# refreshing playlists (see refresh.REFRESH_CONCURRENCY) would otherwise
+# crowd out ordinary cache reads sharing that same default pool, the same
+# problem health.py solved the same way for stream probing.
+_SYNC_POOL_SIZE = int(os.environ.get("M3U_SYNC_POOL_SIZE", "16"))
+_pool: Optional[ThreadPoolExecutor] = None
+
+
+def _get_pool() -> ThreadPoolExecutor:
+    global _pool
+    if _pool is None:
+        _pool = ThreadPoolExecutor(max_workers=_SYNC_POOL_SIZE, thread_name_prefix="m3u-sync")
+    return _pool
 
 
 @dataclass
@@ -369,20 +386,24 @@ async def _sync(
     recording) is identical, so both call through here rather than
     duplicating it.
     """
-    if not force_refresh and cache.has_source(playlist_id):
-        return cache.count_documents(playlist_id)
+    # Off the event loop thread — cache.py is synchronous sqlite3 behind a
+    # shared threading.RLock, so calling these inline blocks every other
+    # request whenever another thread (a health sweep, another sync) is
+    # mid-transaction on that same lock.
+    if not force_refresh and await asyncio.to_thread(cache.has_source, playlist_id):
+        return await asyncio.to_thread(cache.count_documents, playlist_id)
 
     # Same double-checked locking as sync_channel: a background refresh and
     # a user hitting Rescan must not both sync the same playlist.
     async with _lock_for(playlist_id):
-        if not force_refresh and cache.has_source(playlist_id):
-            return cache.count_documents(playlist_id)
+        if not force_refresh and await asyncio.to_thread(cache.has_source, playlist_id):
+            return await asyncio.to_thread(cache.count_documents, playlist_id)
         # Fetching (or decoding), parsing and the bulk insert are all
         # blocking, and a large playlist is hundreds of thousands of lines —
         # this would stall the event loop for everyone else.
         try:
-            count = await asyncio.to_thread(
-                _sync_blocking, playlist_id, fetch_text, on_progress, allow_shrink
+            count = await asyncio.get_running_loop().run_in_executor(
+                _get_pool(), _sync_blocking, playlist_id, fetch_text, on_progress, allow_shrink
             )
         except PlaylistError as e:
             streak = await asyncio.to_thread(cache.record_fetch, playlist_id, e.status, str(e))

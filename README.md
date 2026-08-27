@@ -96,9 +96,12 @@ required in addition to, the phone login above.
 | `TG_API_HASH` | no | — | Telegram API app hash |
 | `TG_CACHE_REFRESH_SECONDS` | no | `1800` | How often Telegram channels are refreshed. Telegram only — playlists have their own schedule below |
 | `M3U_REFRESH_MINUTES` | no | `1440` | Default re-fetch interval for a playlist that hasn't set its own (24h). Each playlist can override this in its settings |
-| `PANDA_NIGHTLY_HOUR` | no | `3` | Local hour the nightly window starts. Playlists on a daily-or-slower interval refresh here rather than at whatever time the app happened to start |
+| `PANDA_NIGHTLY_HOUR` | no | `6` | Local hour the nightly window starts. Playlists on a daily-or-slower interval refresh here rather than at whatever time the app happened to start |
 | `PANDA_NIGHTLY_WINDOW_HOURS` | no | `2` | How long that window stays open |
 | `REFRESH_TICK_SECONDS` | no | `300` | How often the scheduler wakes to look for due work. Not how often anything is refreshed |
+| `PLAYLIST_REFRESH_CONCURRENCY` | no | `10` | Playlist syncs in flight at once during a scheduled refresh, across all providers |
+| `PLAYLIST_REFRESH_PER_HOST` | no | `2` | Playlist syncs in flight *per provider* during a scheduled refresh |
+| `M3U_SYNC_POOL_SIZE` | no | `16` | Worker threads available for playlist fetch/parse/write, kept separate from other background work |
 | `M3U_SHRINK_GUARD_RATIO` | no | `0.5` | Refuse a playlist that comes back below this fraction of its previous size. `0` disables the guard |
 | `M3U_SHRINK_MIN_ENTRIES` | no | `50` | Playlists smaller than this skip the shrink guard — ratios are noise at that size |
 | `HEALTH_CONCURRENCY` | no | `8` | Stream probes in flight at once, across all providers |
@@ -194,11 +197,17 @@ heaviest routine thing the app does — the default is **once a night**, which
 suits how often providers actually publish changes.
 
 Set a per-playlist interval when you add or edit one. Anything daily or
-slower runs in the nightly window (`PANDA_NIGHTLY_HOUR`, 03:00 local by
+slower runs in the nightly window (`PANDA_NIGHTLY_HOUR`, 06:00 local by
 default) rather than exactly 24h after the last run, so the work lands while
 nobody's watching. If the machine is off at that hour, it catches up at the
 next opportunity instead of skipping the day. Shorter intervals just run when
 they come due.
+
+Playlists due at the same time refresh concurrently rather than one at a
+time, throttled the same way the stream check is — a handful in flight per
+provider (`PLAYLIST_REFRESH_PER_HOST`) so a burst of due playlists doesn't
+hammer one server, with an overall cap (`PLAYLIST_REFRESH_CONCURRENCY`)
+across all of them.
 
 ## Upgrading to 3.0
 

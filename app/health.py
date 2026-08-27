@@ -68,9 +68,10 @@ TIMEOUT_SECONDS = float(os.environ.get("HEALTH_TIMEOUT_SECONDS", "5"))
 MAX_MINUTES = int(os.environ.get("HEALTH_MAX_MINUTES", "60"))
 MAX_URLS = int(os.environ.get("HEALTH_MAX_URLS", "20000"))
 
-# Don't re-probe something checked this recently. Slightly under a day, so
-# a nightly sweep never skips a URL just because it ran a few minutes early.
-MIN_AGE_HOURS = float(os.environ.get("HEALTH_MIN_AGE_HOURS", "20"))
+# Don't re-probe something checked this recently. A full day, matching
+# INTERVAL_HOURS below — "remaining" (unchecked + stale) and the nightly
+# sweep both read due-ness off this same window.
+MIN_AGE_HOURS = float(os.environ.get("HEALTH_MIN_AGE_HOURS", "24"))
 
 # How often the whole thing should happen.
 INTERVAL_HOURS = float(os.environ.get("HEALTH_INTERVAL_HOURS", "24"))
@@ -110,6 +111,20 @@ _KEY_LAST_SWEEP = "stream_health_last_sweep"
 # an hour and stall ordinary browsing.
 _pool: Optional[ThreadPoolExecutor] = None
 _running = False
+
+# Playlists' checks running at once. Each playlist's own probes are still
+# throttled by _gate/_host_gates below, so this isn't about provider safety
+# — it's about not letting unrelated providers wait behind each other. A
+# playlist whose URLs all sit on one slow/rate-limited host used to hold the
+# entire queue hostage, even for playlists on completely different hosts.
+PLAYLIST_CONCURRENCY = int(os.environ.get("HEALTH_PLAYLIST_CONCURRENCY", "4"))
+
+# Shared across every concurrently-running playlist check — module-level,
+# not created per _probe_scope call, so two playlists that happen to
+# reference the same host are still capped at PER_HOST between them, not
+# PER_HOST each.
+_gate = asyncio.Semaphore(CONCURRENCY)
+_host_gates: Dict[Tuple[str, int], asyncio.Semaphore] = {}
 
 # Playlists waiting for the worker loop, each {"playlist": Playlist, "jobId": str}.
 # A plain list, not a set: order is the whole point (FIFO), and coalescing
@@ -348,13 +363,11 @@ async def _probe_scope(
 
     loop = asyncio.get_running_loop()
     pool = _get_pool()
-    gate = asyncio.Semaphore(CONCURRENCY)
-    host_gates: Dict[Tuple[str, int], asyncio.Semaphore] = {}
     writes: List[tuple] = []
     done = 0
 
     async def run(fn, *args):
-        async with gate:
+        async with _gate:
             return await loop.run_in_executor(pool, fn, *args)
 
     def note(rows: List[tuple]) -> None:
@@ -369,7 +382,12 @@ async def _probe_scope(
             await asyncio.to_thread(cache.record_stream_health, batch)
 
     def progress() -> None:
-        if on_progress and done % 50 == 0:
+        # Fired after every single probe, not batched — a sweep runs for up
+        # to an hour, and the job's progress bar should move the moment each
+        # one concludes rather than jumping in steps of 50. This only ever
+        # sets an in-memory dict value (jobs.progress_cb), so there's no
+        # per-call cost worth throttling against.
+        if on_progress:
             on_progress(done, len(candidates))
 
     # ---- phase 1: settle the big hosts wholesale where we can --------
@@ -408,7 +426,7 @@ async def _probe_scope(
         nonlocal done
         if time.time() > deadline:
             return None
-        host_gate = host_gates.setdefault(key, asyncio.Semaphore(PER_HOST))
+        host_gate = _host_gates.setdefault(key, asyncio.Semaphore(PER_HOST))
         # Per host first, then the global gate inside run(): a slot is
         # only held while there is real work to do with it.
         async with host_gate:
@@ -452,6 +470,12 @@ async def _probe_scope(
         # the background.
         for t in tasks:
             t.cancel()
+        # Whatever finished before the failure is real work already done —
+        # losing it would mean every probe run since the last 200-write
+        # batch (or a whole sweep, on a server restart) gets silently
+        # thrown away instead of counted. Flush it before propagating, so a
+        # failed sweep still leaves the URLs it reached checked.
+        await flush(force=True)
         raise
 
     await flush(force=True)
@@ -532,33 +556,57 @@ def _ensure_worker() -> None:
         _worker_task = asyncio.create_task(_worker_loop())
 
 
+async def _run_one(item: dict) -> None:
+    """Check one queued playlist's streams and record the job's outcome."""
+    job_id = item["jobId"]
+    playlist = item["playlist"]
+    jobs.start(job_id)
+    scope = [(playlist.id, playlist.allowedExtensions)]
+    try:
+        summary = await _probe_scope(scope, on_progress=jobs.progress_cb(job_id))
+        log.info("Stream check for %s: %s", playlist.name, summary)
+        jobs.finish(job_id, "done")
+    except asyncio.CancelledError:
+        jobs.finish(job_id, "error", "Stream check was interrupted — the server restarted")
+        raise
+    except Exception as e:
+        log.warning("Stream check failed for playlist %s: %s", playlist.id, e)
+        jobs.finish(job_id, "error", str(e))
+
+
 async def _worker_loop() -> None:
-    """Drain the queue one playlist at a time, picking up anything appended
-    while it runs. This is the single point of concurrency control — only
-    one playlist is ever probed at once, same as the old single sweep, so a
-    provider never sees more than one check's worth of traffic regardless of
-    how many playlists asked for one.
+    """Drain the queue, running up to PLAYLIST_CONCURRENCY playlists' checks
+    at once rather than strictly one at a time. Provider safety doesn't
+    depend on that serialization — _gate/_host_gates are shared module-level
+    state, so a host is capped at PER_HOST connections no matter how many
+    playlists' checks are running concurrently and happen to reference it.
+    What the old one-at-a-time loop actually did was let a playlist whose
+    URLs all sit on one slow or heavily-throttled host occupy the entire
+    queue, leaving playlists on completely unrelated hosts waiting behind it
+    for no safety reason at all.
     """
     global _running
     _running = True
+    running: Dict[asyncio.Task, dict] = {}
     try:
-        while _queue:
-            item = _queue.pop(0)
-            job_id = item["jobId"]
-            playlist = item["playlist"]
-            jobs.start(job_id)
-            scope = [(playlist.id, playlist.allowedExtensions)]
-            try:
-                summary = await _probe_scope(scope, on_progress=jobs.progress_cb(job_id))
-                log.info("Stream check for %s: %s", playlist.name, summary)
-                jobs.finish(job_id, "done")
-            except asyncio.CancelledError:
-                jobs.finish(job_id, "error", "Stream check was interrupted — the server restarted")
-                raise
-            except Exception as e:
-                log.warning("Stream check failed for playlist %s: %s", playlist.id, e)
-                jobs.finish(job_id, "error", str(e))
+        while _queue or running:
+            while _queue and len(running) < PLAYLIST_CONCURRENCY:
+                item = _queue.pop(0)
+                running[asyncio.create_task(_run_one(item))] = item
+            if not running:
+                break
+            done, _pending = await asyncio.wait(running.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                del running[t]
         await asyncio.to_thread(cache.prune_stream_health)
+    except asyncio.CancelledError:
+        # A cancelled worker loop must not leave its in-flight playlist
+        # checks running unsupervised in the background — same reasoning as
+        # _probe_scope's own probe-level cancellation handling.
+        for t in running:
+            t.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        raise
     finally:
         _running = False
         # Stamped whenever the queue empties, whatever triggered it: a

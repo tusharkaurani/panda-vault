@@ -8,12 +8,12 @@ export function streamExt(url?: string | null): string | null {
   return last.split(".").pop()!.toLowerCase().slice(0, 6);
 }
 
-/** StreamPlayerModal only speaks HLS (native Safari playback or hls.js) — it
- *  has no path for a raw video file, so offering it for an .mp4/.ts/.mkv URL
- *  just opens a modal that fails every time. */
+/** Extensions StreamPlayerModal plays via hls.js / Safari's native HLS
+ *  support. Everything else falls back to an iframe and the browser's own
+ *  native player instead. */
 const HLS_EXTENSIONS = new Set(["m3u8", "m3u"]);
 
-export function isPlayableStream(url?: string | null): boolean {
+export function isHlsStream(url?: string | null): boolean {
   const ext = streamExt(url);
-  return !!url && !!ext && HLS_EXTENSIONS.has(ext);
+  return !!ext && HLS_EXTENSIONS.has(ext);
 }

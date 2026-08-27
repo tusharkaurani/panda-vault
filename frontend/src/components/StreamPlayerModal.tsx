@@ -1,13 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
+import { isHlsStream } from "../lib/streams";
 
-/** Plays a stream in-app via hls.js, as an alternative to the entry's default
- *  click, which just hands the raw URL to the browser — fine for a direct
- *  media file, but a `.m3u8` manifest has no player behind it on any browser
- *  without native HLS support (i.e. everything but Safari), so it renders as
- *  text instead of video. Safari gets native `<video src>` since it already
- *  understands HLS and loading hls.js on top would just double the work. */
+/** Plays a stream in-app, as an alternative to the entry's default click,
+ *  which just hands the raw URL to the browser. For a `.m3u8` manifest that's
+ *  no help on any browser without native HLS support (i.e. everything but
+ *  Safari) — it renders as text instead of video, so this pulls in hls.js.
+ *  Safari gets native `<video src>` since it already understands HLS and
+ *  loading hls.js on top would just double the work. Anything else (a direct
+ *  .mp4/.ts/.mkv/... file) has no manifest for hls.js to parse, so it's
+ *  handed to an iframe instead — the browser's own native player renders it
+ *  the same way it would if the URL were opened in a new tab, just inline. */
 export default function StreamPlayerModal({
   url,
   name,
@@ -19,8 +23,10 @@ export default function StreamPlayerModal({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const isHls = isHlsStream(url);
 
   useEffect(() => {
+    if (!isHls) return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -75,7 +81,7 @@ export default function StreamPlayerModal({
       video.removeEventListener("playing", clearStall);
       hls?.destroy();
     };
-  }, [url]);
+  }, [url, isHls]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -109,8 +115,20 @@ export default function StreamPlayerModal({
           <div className="flex aspect-video items-center justify-center rounded-lg bg-black text-sm text-panda-muted">
             {error}
           </div>
-        ) : (
+        ) : isHls ? (
           <video ref={videoRef} controls autoPlay className="aspect-video w-full rounded-lg bg-black" />
+        ) : (
+          // No manifest for hls.js to parse, so this leans on the browser's
+          // own handling of the URL — the same thing a direct navigation
+          // would do, just inline. A provider that blocks framing (X-Frame-
+          // Options/CSP) renders blank; "Open the stream" is the fallback.
+          <iframe
+            src={url}
+            title={name}
+            allow="autoplay; fullscreen"
+            allowFullScreen
+            className="aspect-video w-full rounded-lg border-0 bg-black"
+          />
         )}
       </div>
     </div>,

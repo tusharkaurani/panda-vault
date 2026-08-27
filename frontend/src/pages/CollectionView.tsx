@@ -5,6 +5,7 @@ import { api, ApiError } from "../api";
 import type { DocumentOut, Collection, GroupSummary, HealthTotals, Source } from "../types";
 import { isPlaylist } from "../types";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
+import { useStreamHealthFilter } from "../lib/useStreamHealthFilter";
 import { useIntegrations } from "../integrations/IntegrationsContext";
 import { telegramUrl } from "../lib/telegram";
 import { findPath } from "../lib/collections";
@@ -49,13 +50,19 @@ export default function CollectionView() {
   // null = "the user hasn't chosen", so the default can depend on what
   // kind of collection this turns out to be once the tree loads.
   const [sort, setSort] = useState<string | null>(null);
-  // Reachability filter. Only meaningful for m3u, and reset when navigating
-  // to another collection (see the effect below) so a filter set on one
-  // playlist doesn't silently hide another's contents.
-  const [health, setHealth] = useState<string>("");
+  // Reachability filter. Only meaningful for m3u. Defaults to "Working" and,
+  // unlike search/sort, carries across collections until the user changes it.
+  const [health, setHealth] = useStreamHealthFilter();
   const [healthTotals, setHealthTotals] = useState<HealthTotals>({});
   // m3u only — grouped-by-category is the default, flat list is the fallback.
   const [viewMode, setViewMode] = useState<"grouped" | "list">("grouped");
+  // Whether the last `groups` fetch found more than one category worth
+  // showing. null = not checked yet. A playlist with no #EXTGRP/group-title
+  // at all collapses to a single "" bucket — rendering that as a folder card
+  // labelled "Other channels" the user has to click through is pure friction
+  // for a source that was never actually categorized, so that case (and the
+  // zero-groups case) falls back to the flat list as if grouping didn't exist.
+  const [groupingAvailable, setGroupingAvailable] = useState<boolean | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
@@ -72,7 +79,7 @@ export default function CollectionView() {
   // affordance all differ.
   const isM3u = node?.sourceType === "m3u";
 
-  const grouped = isM3u && viewMode === "grouped";
+  const grouped = isM3u && viewMode === "grouped" && groupingAvailable !== false;
   // Every entry in a playlist snapshot carries the same fetch timestamp, so
   // date_desc would order by ordinal *descending* — the playlist backwards.
   // Ascending ordinals are the order the provider actually wrote.
@@ -134,6 +141,7 @@ export default function CollectionView() {
         health: health || undefined,
       });
       setGroups(res.groups);
+      setGroupingAvailable(res.groups.length > 1);
       setSources(res.sources);
       setDocErrors(res.errors ?? []);
       setHealthTotals(res.healthTotals ?? {});
@@ -165,9 +173,11 @@ export default function CollectionView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collectionId, node?.sourceIds.length, grouped, effectiveSort, debouncedSearch, health, jobsCompleted]);
 
-  // A filter that made sense in one collection would silently hide most of
-  // the next one, so it doesn't survive navigation.
-  useEffect(() => setHealth(""), [collectionId]);
+  // A source's category count is a property of that source, not of whatever
+  // filter happens to be active — recheck it fresh per collection rather
+  // than carrying a stale verdict (or a stale filtered-down one) across a
+  // navigation.
+  useEffect(() => setGroupingAvailable(null), [collectionId]);
 
   // Follow a running stream check. Only the tallies are re-read: re-fetching
   // the documents would replace an infinite-scrolled list with its first
@@ -353,7 +363,7 @@ export default function CollectionView() {
               placeholder={isM3u ? "Filter channels in this collection…" : "Filter documents in this collection…"}
               className="flex-1 min-w-[200px] bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
             />
-            {isM3u && (
+            {isM3u && groupingAvailable !== false && (
               <div className="flex items-center overflow-hidden rounded-lg border border-panda-border text-sm">
                 <Tooltip label="Cards grouped by category">
                   <button
