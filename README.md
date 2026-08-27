@@ -106,10 +106,11 @@ required in addition to, the phone login above.
 | `M3U_SHRINK_MIN_ENTRIES` | no | `50` | Playlists smaller than this skip the shrink guard — ratios are noise at that size |
 | `HEALTH_CONCURRENCY` | no | `8` | Stream probes in flight at once, across all providers |
 | `HEALTH_PER_HOST` | no | `2` | Probes in flight *per provider*. The one that stops you being rate-limited — raise it with care |
-| `HEALTH_TIMEOUT_SECONDS` | no | `5` | How long to wait for a stream to answer |
+| `HEALTH_TIMEOUT_SECONDS` | no | `5` | How long to wait for a stream to answer, once connected |
+| `HEALTH_HANG_CEILING_SECONDS` | no | `20` | Wall-clock backstop around a whole probe, including DNS resolution — which `HEALTH_TIMEOUT_SECONDS` can't bound since the stdlib resolver has no timeout of its own |
 | `HEALTH_MAX_MINUTES` | no | `60` | Wall-clock budget for one check. Leftovers carry to the next night |
 | `HEALTH_MAX_URLS` | no | `20000` | Most URLs one check will look at |
-| `HEALTH_MIN_AGE_HOURS` | no | `20` | Don't re-check a URL seen more recently than this |
+| `HEALTH_MIN_AGE_HOURS` | no | `24` | Don't re-check a URL seen more recently than this |
 | `HEALTH_INTERVAL_HOURS` | no | `24` | How often the stream check should run |
 | `M3U_USER_AGENT` | no | `VLC/3.0.20 LibVLC/3.0.20` | Sent when fetching a playlist. Many providers reject unfamiliar clients |
 | `M3U_TIMEOUT_SECONDS` | no | `30` | Playlist fetch timeout |

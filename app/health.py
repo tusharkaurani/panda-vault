@@ -63,6 +63,17 @@ PER_HOST = int(os.environ.get("HEALTH_PER_HOST", "2"))
 # its first bytes is not one anybody wants to watch anyway.
 TIMEOUT_SECONDS = float(os.environ.get("HEALTH_TIMEOUT_SECONDS", "5"))
 
+# TIMEOUT_SECONDS only bounds the socket once it exists — DNS resolution
+# (getaddrinfo) happens before that and has no timeout parameter anywhere in
+# the stdlib, so a resolver that just hangs (common once a free-IPTV domain
+# goes stale) can block a probe far longer than TIMEOUT_SECONDS ever
+# suggests. This is the wall-clock backstop around the whole blocking call:
+# past it we stop *waiting*, so the gate slot and this playlist's turn in
+# the queue free up. It can't stop the underlying OS thread mid-resolution —
+# Python can't cancel a blocking call — so an abandoned probe still occupies
+# one pool worker until the resolver itself eventually gives up.
+HANG_CEILING_SECONDS = float(os.environ.get("HEALTH_HANG_CEILING_SECONDS", "20"))
+
 # Wall-clock ceiling for one sweep. Whatever is left over is simply picked
 # up by the next one.
 MAX_MINUTES = int(os.environ.get("HEALTH_MAX_MINUTES", "60"))
@@ -368,7 +379,9 @@ async def _probe_scope(
 
     async def run(fn, *args):
         async with _gate:
-            return await loop.run_in_executor(pool, fn, *args)
+            return await asyncio.wait_for(
+                loop.run_in_executor(pool, fn, *args), timeout=HANG_CEILING_SECONDS
+            )
 
     def note(rows: List[tuple]) -> None:
         for row in rows:
@@ -396,7 +409,13 @@ async def _probe_scope(
         host, port = key
         if time.time() > deadline:
             return None
-        alive, why = await run(host_reachable, host, port)
+        try:
+            alive, why = await run(host_reachable, host, port)
+        except asyncio.TimeoutError:
+            # Same reasoning as host_reachable's own socket.timeout branch:
+            # ambiguous, so it doesn't condemn the host — its URLs fall
+            # through to being probed individually.
+            alive, why = True, None
         if alive:
             return None
         summary["hostsSkipped"] += 1
@@ -432,7 +451,10 @@ async def _probe_scope(
         async with host_gate:
             if time.time() > deadline:
                 return None
-            result = await run(probe, url)
+            try:
+                result = await run(probe, url)
+            except asyncio.TimeoutError:
+                result = Probe(url, cache.STREAM_UNKNOWN, error="timed out")
         status, new_streak = _verdict(result, streak)
         done += 1
         progress()
