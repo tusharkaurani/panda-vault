@@ -2,16 +2,24 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { Home, Loader2 } from "lucide-react";
 import { api, ApiError } from "../api";
-import type { SearchResult } from "../types";
+import type { SearchResult, SourceType } from "../types";
 import { MIN_SEARCH_LENGTH, SEARCH_PAGE_SIZE } from "../lib/search";
+import { useIntegrations } from "../integrations/IntegrationsContext";
 import Breadcrumbs from "../components/Breadcrumbs";
 import ItemRow from "../components/ItemRow";
 import EmptyState from "../components/EmptyState";
 import ErrorBanner from "../components/ErrorBanner";
 
+function isSourceType(value: string): value is SourceType {
+  return value === "telegram" || value === "m3u";
+}
+
 export default function Search() {
   const [params] = useSearchParams();
   const q = params.get("q") || "";
+  const typeParam = params.get("type") || "";
+  const sourceType = isSourceType(typeParam) ? typeParam : undefined;
+  const { byId } = useIntegrations();
   const [results, setResults] = useState<SearchResult[] | null>(null);
   const [total, setTotal] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -35,7 +43,7 @@ export default function Search() {
     setLoading(true);
     setError(null);
     api
-      .search(q, { offset: 0, limit: SEARCH_PAGE_SIZE, signal: controller.signal })
+      .search(q, { offset: 0, limit: SEARCH_PAGE_SIZE, sourceType, signal: controller.signal })
       .then((r) => {
         if (gen !== genRef.current) return;
         setResults(r.results);
@@ -49,14 +57,14 @@ export default function Search() {
         if (gen === genRef.current) setLoading(false);
       });
     return () => controller.abort();
-  }, [q]);
+  }, [q, sourceType]);
 
   const loadMore = useCallback(async () => {
     if (loading || loadingMore || results === null || results.length >= total) return;
     const gen = genRef.current;
     setLoadingMore(true);
     try {
-      const r = await api.search(q, { offset: results.length, limit: SEARCH_PAGE_SIZE });
+      const r = await api.search(q, { offset: results.length, limit: SEARCH_PAGE_SIZE, sourceType });
       if (gen !== genRef.current) return;
       setResults((prev) => (prev ? [...prev, ...r.results] : r.results));
       setTotal(r.total);
@@ -65,7 +73,7 @@ export default function Search() {
     } finally {
       if (gen === genRef.current) setLoadingMore(false);
     }
-  }, [q, loading, loadingMore, results, total]);
+  }, [q, sourceType, loading, loadingMore, results, total]);
 
   useEffect(() => {
     const el = sentinelRef.current;
@@ -90,7 +98,11 @@ export default function Search() {
 
       <div>
         <h1 className="text-2xl font-semibold">Search results</h1>
-        {q && <p className="text-panda-muted text-sm mt-1">for “{q}”</p>}
+        {q && (
+          <p className="text-panda-muted text-sm mt-1">
+            for “{q}”{sourceType && <> in {byId(sourceType)?.name ?? sourceType}</>}
+          </p>
+        )}
         {results && results.length > 0 && (
           <p className="text-panda-muted text-sm mt-1">
             Showing {results.length} of {total.toLocaleString()}

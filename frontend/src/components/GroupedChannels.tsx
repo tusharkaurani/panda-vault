@@ -23,13 +23,24 @@ export function groupParamFromUrl(slug: string): string {
  *  linking to that category's own page. Deliberately no channel tiles here —
  *  a category can hold hundreds of channels, and this is a table of
  *  contents, not the browsing surface itself. */
-export default function GroupedChannels({ collectionId, groups }: { collectionId: string; groups: GroupSummary[] }) {
+export default function GroupedChannels({
+  collectionId,
+  groups,
+  search,
+}: {
+  collectionId: string;
+  groups: GroupSummary[];
+  /** The collection view's current filter, carried into the category page's
+   *  own `q` param so clicking a card doesn't reset it back to "all". */
+  search?: string;
+}) {
+  const query = search ? `?q=${encodeURIComponent(search)}` : "";
   return (
     <div className="grid grid-cols-1 min-[420px]:grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
       {groups.map((g) => (
         <Link
           key={g.name || UNGROUPED_SLUG}
-          to={`/c/${collectionId}/group/${groupUrlSlug(g.name)}`}
+          to={`/c/${collectionId}/group/${groupUrlSlug(g.name)}${query}`}
           className="group flex flex-col gap-3 rounded-xl border border-panda-border bg-panda-surface p-5 transition-all hover:-translate-y-0.5 hover:border-panda-accent"
         >
           <div className="flex items-start justify-between gap-2">

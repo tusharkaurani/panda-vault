@@ -246,10 +246,14 @@ export const api = {
     keywords: (id: string, limit = 8) =>
       request<{ keywords: KeywordCount[] }>(`/collections/${id}/keywords?limit=${limit}`),
   },
-  search: (q: string, opts: { offset?: number; limit?: number; signal?: AbortSignal } = {}) => {
+  search: (
+    q: string,
+    opts: { offset?: number; limit?: number; sourceType?: SourceType; signal?: AbortSignal } = {}
+  ) => {
     const params = new URLSearchParams({ q });
     if (opts.offset) params.set("offset", String(opts.offset));
     if (opts.limit) params.set("limit", String(opts.limit));
+    if (opts.sourceType) params.set("source_type", opts.sourceType);
     // Note: an aborted request rejects with a DOMException named
     // "AbortError", not an ApiError — callers must let that one through.
     return request<SearchResponse>(`/search?${params}`, { signal: opts.signal });

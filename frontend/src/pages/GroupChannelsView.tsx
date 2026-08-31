@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
-import { Home, Loader2 } from "lucide-react";
+import { useParams, useSearchParams } from "react-router-dom";
+import { Home, Loader2, X } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { Collection, DocumentOut, HealthTotals } from "../types";
 import { useDebouncedValue } from "../lib/useDebouncedValue";
@@ -33,8 +33,25 @@ export default function GroupChannelsView() {
   const [docs, setDocs] = useState<DocumentOut[] | null>(null);
   const [total, setTotal] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
+  // Seeded from the `q` param the collection card carried here, and mirrored
+  // back into it as the user keeps typing — see CollectionView for the other
+  // half of this handoff.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [search, setSearch] = useState(() => searchParams.get("q") ?? "");
   const debouncedSearch = useDebouncedValue(search, 350);
+
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (debouncedSearch) next.set("q", debouncedSearch);
+        else next.delete("q");
+        return next;
+      },
+      { replace: true }
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch]);
   const [health, setHealth] = useStreamHealthFilter();
   const [healthTotals, setHealthTotals] = useState<HealthTotals>({});
   const [loadingMore, setLoadingMore] = useState(false);
@@ -144,13 +161,25 @@ export default function GroupChannelsView() {
 
       {error && <ErrorBanner message={error} />}
 
-      <div className="flex items-center gap-2 flex-wrap">
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Filter channels in this category…"
-          className="flex-1 min-w-[200px] bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
-        />
+      <div className="sticky top-[var(--header-h)] z-[5] -mx-4 flex flex-wrap items-center gap-2 bg-panda-bg/95 px-4 py-3 backdrop-blur">
+        <div className="relative flex-1 min-w-[200px]">
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter channels in this category…"
+            className="w-full bg-panda-surface border border-panda-border rounded-lg pl-3 pr-8 py-2 text-sm outline-none focus:border-panda-accent"
+          />
+          {search && (
+            <button
+              type="button"
+              onClick={() => setSearch("")}
+              aria-label="Clear search"
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-panda-muted hover:text-panda-text"
+            >
+              <X size={14} />
+            </button>
+          )}
+        </div>
         <select
           value={health}
           onChange={(e) => setHealth(e.target.value)}

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
-import { ExternalLink, Home, LayoutGrid, List, Loader2, RefreshCw } from "lucide-react";
+import { useParams, useSearchParams } from "react-router-dom";
+import { ExternalLink, Home, LayoutGrid, List, Loader2, RefreshCw, X } from "lucide-react";
 import { api, ApiError } from "../api";
 import type { DocumentOut, Collection, GroupSummary, HealthTotals, Source } from "../types";
 import { isPlaylist } from "../types";
@@ -45,8 +45,26 @@ export default function CollectionView() {
   const [sources, setSources] = useState<Source[]>([]);
   const [docErrors, setDocErrors] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
+  // Mirrored into the `q` URL param (debounced, so typing doesn't spam
+  // history) rather than kept purely local — a group card's link reads it
+  // from here so the filter survives clicking into a category instead of
+  // resetting to "all".
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [search, setSearch] = useState(() => searchParams.get("q") ?? "");
   const debouncedSearch = useDebouncedValue(search, 350);
+
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (debouncedSearch) next.set("q", debouncedSearch);
+        else next.delete("q");
+        return next;
+      },
+      { replace: true }
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedSearch]);
   // null = "the user hasn't chosen", so the default can depend on what
   // kind of collection this turns out to be once the tree loads.
   const [sort, setSort] = useState<string | null>(null);
@@ -95,7 +113,7 @@ export default function CollectionView() {
         refresh,
         offset: 0,
         limit: PAGE_SIZE,
-        health: health || undefined,
+        health: (isM3u && health) || undefined,
       });
       setDocs(res.documents);
       setTotal(res.total);
@@ -120,7 +138,7 @@ export default function CollectionView() {
         sort: effectiveSort,
         offset: docs.length,
         limit: PAGE_SIZE,
-        health: health || undefined,
+        health: (isM3u && health) || undefined,
       });
       setDocs((prev) => (prev ? [...prev, ...res.documents] : res.documents));
       setTotal(res.total);
@@ -356,13 +374,28 @@ export default function CollectionView() {
 
       {node.sourceIds.length > 0 && (
         <>
-          <form onSubmit={onSearchSubmit} className="flex items-center gap-2 flex-wrap">
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={isM3u ? "Filter channels in this collection…" : "Filter documents in this collection…"}
-              className="flex-1 min-w-[200px] bg-panda-surface border border-panda-border rounded-lg px-3 py-2 text-sm outline-none focus:border-panda-accent"
-            />
+          <form
+            onSubmit={onSearchSubmit}
+            className="sticky top-[var(--header-h)] z-[5] -mx-4 flex flex-wrap items-center gap-2 bg-panda-bg/95 px-4 py-3 backdrop-blur"
+          >
+            <div className="relative flex-1 min-w-[200px]">
+              <input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={isM3u ? "Filter channels in this collection…" : "Filter documents in this collection…"}
+                className="w-full bg-panda-surface border border-panda-border rounded-lg pl-3 pr-8 py-2 text-sm outline-none focus:border-panda-accent"
+              />
+              {search && (
+                <button
+                  type="button"
+                  onClick={() => setSearch("")}
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-panda-muted hover:text-panda-text"
+                >
+                  <X size={14} />
+                </button>
+              )}
+            </div>
             {isM3u && groupingAvailable !== false && (
               <div className="flex items-center overflow-hidden rounded-lg border border-panda-border text-sm">
                 <Tooltip label="Cards grouped by category">
@@ -461,7 +494,9 @@ export default function CollectionView() {
                   hint="Nothing here yet, or your filter didn't match any channel."
                 />
               )}
-              {groups && groups.length > 0 && <GroupedChannels collectionId={collectionId} groups={groups} />}
+              {groups && groups.length > 0 && (
+                <GroupedChannels collectionId={collectionId} groups={groups} search={debouncedSearch} />
+              )}
             </>
           ) : (
             <>

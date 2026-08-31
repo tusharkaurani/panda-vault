@@ -1,10 +1,10 @@
 import asyncio
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Query
 
 from .. import cache, sources, store
-from ..models import Collection
+from ..models import Collection, SourceType
 
 router = APIRouter(prefix="/api/search", tags=["search"])
 
@@ -18,13 +18,21 @@ def _walk_bound_collections(nodes: List[Collection]):
 
 
 @router.get("")
-async def search(q: str = Query(..., min_length=2), offset: int = 0, limit: int = 20):
+async def search(
+    q: str = Query(..., min_length=2),
+    offset: int = 0,
+    limit: int = 20,
+    source_type: Optional[SourceType] = None,
+):
     """Substring search over every item in every collection-bound source.
 
-    Spans every integration at once — Telegram documents and M3U entries
-    come back interleaved in one page, each row carrying the sourceType it
-    takes to render and link it. That stays a single SQL query because the
-    cache partitions by source id without caring which kind it is.
+    Spans every integration at once by default — Telegram documents and M3U
+    entries come back interleaved in one page, each row carrying the
+    sourceType it takes to render and link it. That stays a single SQL query
+    because the cache partitions by source id without caring which kind it
+    is. Passing `source_type` narrows the scope to just that integration —
+    the UI uses it so search from inside a Library section only searches
+    that section.
 
     Returns one page of results, each carrying only the ids and names it
     takes to render a row. It used to embed the matching document's whole
@@ -49,7 +57,14 @@ async def search(q: str = Query(..., min_length=2), offset: int = 0, limit: int 
             if source_id in all_sources:
                 owner.setdefault(source_id, node)
 
-    scope = [(sid, all_sources[sid].allowedExtensions) for sid in owner]
+    # Neither Channel nor Playlist itself carries a sourceType (see
+    # sources.Source) — the owning collection does, inherited from its root,
+    # so that's what a type filter has to key on instead.
+    scope = [
+        (sid, all_sources[sid].allowedExtensions)
+        for sid in owner
+        if source_type is None or owner[sid].sourceType == source_type
+    ]
     offset = max(0, offset)
     limit = max(1, min(limit, 100))
     docs, total = await asyncio.to_thread(cache.query_documents, scope, q, "date_desc", offset, limit)
