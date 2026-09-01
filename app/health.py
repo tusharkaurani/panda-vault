@@ -79,10 +79,13 @@ HANG_CEILING_SECONDS = float(os.environ.get("HEALTH_HANG_CEILING_SECONDS", "20")
 MAX_MINUTES = int(os.environ.get("HEALTH_MAX_MINUTES", "60"))
 MAX_URLS = int(os.environ.get("HEALTH_MAX_URLS", "20000"))
 
-# Don't re-probe something checked this recently. A full day, matching
-# INTERVAL_HOURS below — "remaining" (unchecked + stale) and the nightly
-# sweep both read due-ness off this same window.
-MIN_AGE_HOURS = float(os.environ.get("HEALTH_MIN_AGE_HOURS", "24"))
+# Don't re-probe something checked this recently. Kept a couple hours under
+# INTERVAL_HOURS below (rather than equal to it) so a sweep that starts late
+# one day — the previous one ran long, or drifted past the nightly window —
+# still finds yesterday's URLs due instead of skipping them for being <24h
+# old. "remaining" (unchecked + stale) and the nightly sweep both read
+# due-ness off this window.
+MIN_AGE_HOURS = float(os.environ.get("HEALTH_MIN_AGE_HOURS", "22"))
 
 # How often the whole thing should happen.
 INTERVAL_HOURS = float(os.environ.get("HEALTH_INTERVAL_HOURS", "24"))

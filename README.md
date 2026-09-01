@@ -110,7 +110,7 @@ required in addition to, the phone login above.
 | `HEALTH_HANG_CEILING_SECONDS` | no | `20` | Wall-clock backstop around a whole probe, including DNS resolution — which `HEALTH_TIMEOUT_SECONDS` can't bound since the stdlib resolver has no timeout of its own |
 | `HEALTH_MAX_MINUTES` | no | `60` | Wall-clock budget for one check. Leftovers carry to the next night |
 | `HEALTH_MAX_URLS` | no | `20000` | Most URLs one check will look at |
-| `HEALTH_MIN_AGE_HOURS` | no | `24` | Don't re-check a URL seen more recently than this |
+| `HEALTH_MIN_AGE_HOURS` | no | `22` | Don't re-check a URL seen more recently than this. Kept under `HEALTH_INTERVAL_HOURS` so a sweep that starts late doesn't skip URLs checked during yesterday's run |
 | `HEALTH_INTERVAL_HOURS` | no | `24` | How often the stream check should run |
 | `M3U_USER_AGENT` | no | `VLC/3.0.20 LibVLC/3.0.20` | Sent when fetching a playlist. Many providers reject unfamiliar clients |
 | `M3U_TIMEOUT_SECONDS` | no | `30` | Playlist fetch timeout |

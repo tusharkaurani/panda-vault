@@ -26,7 +26,7 @@ export default function NotificationBell() {
   }
 
   return (
-    <div className="relative shrink-0" ref={ref}>
+    <div className="relative flex shrink-0" ref={ref}>
       <Tooltip label={unreadCount > 0 ? `${unreadCount} unread notification(s)` : "Notifications"} side="bottom">
         <button
           onClick={toggle}
